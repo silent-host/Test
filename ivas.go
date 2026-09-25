@@ -7,9 +7,11 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/chromedp/chromedp"
+	"github.com/go-vgo/robotgo"
 	"github.com/gorilla/websocket"
 )
 
@@ -29,7 +31,6 @@ func init() {
 		edgePort = os.Args[1]
 		botID = os.Args[2]
 	}
-	// اپنا پبلک آئی پی یہاں لگا لو
 	wsServer = fmt.Sprintf("ws://13.53.136.240:8080/ivas%s", botID)
 }
 
@@ -73,6 +74,91 @@ func sendDataToWS(data string) {
 	}
 }
 
+// ================== SQUARE BOX DHOONDNE WALA FUNCTION ==================
+// Ye function screen ke center area ko scan karta hai aur aisa square box
+// dhoondta hai jiske charon taraf dark (grey/black) border ho aur
+// andar safed (white) ho. Yehi Cloudflare checkbox ki pehchaan hai.
+func findCheckboxByShape() (int, int, bool) {
+	// 1. Screen ki size lo
+	sw, sh := robotgo.GetScreenSize()
+
+	// 2. Sirf center area scan karo (fast aur safe)
+	// Cloudflare ka box hamesha center mein hota hai
+	startX := sw / 4
+	startY := sh / 4
+	scanW := sw / 2
+	scanH := sh / 2
+
+	// 3. Screenshot lo us area ka
+	img := robotgo.CaptureImg(startX, startY, scanW, scanH)
+	if img == nil {
+		return 0, 0, false
+	}
+
+	bounds := img.Bounds()
+
+	// 4. Har pixel scan karo (2 pixel ke jump se, taake fast ho)
+	for y := 15; y < bounds.Max.Y-15; y += 2 {
+		for x := 15; x < bounds.Max.X-15; x += 2 {
+
+			// (a) Center WHITE hona chahiye
+			cr, cg, cb, _ := img.At(x, y).RGBA()
+			if cr < 55000 || cg < 55000 || cb < 55000 {
+				continue
+			}
+
+			// (b) Left side DARK hona chahiye (12 pixels door)
+			lr, lg, lb, _ := img.At(x-12, y).RGBA()
+			if lr > 38000 || lg > 38000 || lb > 38000 {
+				continue
+			}
+
+			// (c) Right side DARK
+			rr, rg, rb, _ := img.At(x+12, y).RGBA()
+			if rr > 38000 || rg > 38000 || rb > 38000 {
+				continue
+			}
+
+			// (d) Top side DARK
+			tr, tg, tb, _ := img.At(x, y-12).RGBA()
+			if tr > 38000 || tg > 38000 || tb > 38000 {
+				continue
+			}
+
+			// (e) Bottom side DARK
+			br, bg, bb, _ := img.At(x, y+12).RGBA()
+			if br > 38000 || bg > 38000 || bb > 38000 {
+				continue
+			}
+
+			// Agar charon taraf dark border hai aur center white hai,
+			// to ye 100% checkbox hai!
+			return startX + x, startY + y, true
+		}
+	}
+
+	return 0, 0, false
+}
+
+// ================== ROBOTGO SE CLICK KARNA ==================
+func clickCheckboxWithRobot(x, y int) {
+	fmt.Printf("🖱️ [Bot %s] Checkbox found at (%d, %d). Clicking...\n", botID, x, y)
+
+	// Human ki tarah mouse move karo (pehle thora door, phir target par)
+	robotgo.Move(x-20, y-20)
+	time.Sleep(time.Duration(rand.Intn(400)+200) * time.Millisecond)
+	robotgo.Move(x-5, y-5)
+	time.Sleep(time.Duration(rand.Intn(200)+150) * time.Millisecond)
+	robotgo.Move(x, y)
+	time.Sleep(time.Duration(rand.Intn(200)+150) * time.Millisecond)
+
+	// Asli OS-level click
+	robotgo.Click("left")
+	fmt.Printf("☑️ [Bot %s] Clicked successfully!\n", botID)
+
+	time.Sleep(5 * time.Second)
+}
+
 // ================== مین فنکشن ==================
 func main() {
 	fmt.Printf("=========================================\n")
@@ -97,27 +183,25 @@ func main() {
 		log.Fatalf("❌ [Bot %s] Failed to open website: %v", botID, err)
 	}
 
-	// ================== صرف ریفریش اور ڈیٹا والا لوپ ==================
+	// ================== MAIN LOOP ==================
 	for {
 		// 1. رینڈم وقفہ (40 سے 80 سیکنڈ)
 		randomSeconds := rand.Intn(41) + 40
-		fmt.Printf("⏳ [Bot %s] Waiting %d seconds before next refresh...\n", botID, randomSeconds)
+		fmt.Printf("⏳ [Bot %s] Waiting %d seconds...\n", botID, randomSeconds)
 		time.Sleep(time.Duration(randomSeconds) * time.Second)
 
-		// 2. صرف ریفریش کرو
-		fmt.Printf("🔄 [Bot %s] Refreshing target page...\n", botID)
+		// 2. پیج ریفریش کرو
+		fmt.Printf("🔄 [Bot %s] Refreshing...\n", botID)
 		err := chromedp.Run(ctx, chromedp.Reload())
 		if err != nil {
 			log.Printf("❌ [Bot %s] Refresh error: %v", botID, err)
 			continue
 		}
 
-		// 3. پیج لوڈ ہونے کا انتظار کرو (10 سیکنڈ)
-		// یہ وقت AutoHotkey کو دیا جا رہا ہے تاکہ وہ کلاؤڈ فلیر پر کلک کر سکے
-		fmt.Printf("⏳ [Bot %s] Waiting for page to load (and AHK to click)...\n", botID)
-		time.Sleep(10 * time.Second)
+		// 3. پیج لوڈ ہونے کا انتظار
+		time.Sleep(6 * time.Second)
 
-		// 4. پیج سے ڈیٹا نکالو
+		// 4. پیج کا ٹیکسٹ نکالو
 		var pageText string
 		err = chromedp.Run(ctx,
 			chromedp.Evaluate(`document.body.innerText`, &pageText),
@@ -127,7 +211,29 @@ func main() {
 			continue
 		}
 
-		// 5. ڈیٹا ویب ساکٹ پر بھیج دو
+		// 5. Cloudflare detect karo (text se)
+		if strings.Contains(pageText, "Performing security verification") ||
+			strings.Contains(pageText, "Verify you are human") ||
+			strings.Contains(pageText, "malicious bots") {
+
+			fmt.Printf("🚨 [Bot %s] CLOUDFLARE DETECTED! Scanning screen for checkbox...\n", botID)
+
+			// 6. Screen par square box dhoondo (RobotGo se)
+			cfX, cfY, found := findCheckboxByShape()
+			if found {
+				clickCheckboxWithRobot(cfX, cfY)
+
+				// Click ke baad 8 second wait karo, phir dobara text check karo
+				time.Sleep(8 * time.Second)
+				chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerText`, &pageText))
+			} else {
+				fmt.Printf("⚠️ [Bot %s] Checkbox not found on screen. Retrying next cycle.\n", botID)
+			}
+		} else {
+			fmt.Printf("✅ [Bot %s] No CAPTCHA. Page is clean.\n", botID)
+		}
+
+		// 7. ڈیٹا ویب ساکٹ پر بھیج دو
 		sendDataToWS(pageText)
 	}
 }
