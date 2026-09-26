@@ -13,17 +13,14 @@ BOT_ID = "1"
 WS_SERVER = f"ws://127.0.0.1:8080/ivas{BOT_ID}"
 TARGET_URL = "https://www.ivasms.com/portal/live/my_sms"
 
-# 🧠 Last successful click location
-last_success_x = None
-last_success_y = None
-
-# Scan area: 30% of screen around last success
-SCAN_AREA_PERCENT = 0.30
+# 🧠 Learned size (pichli successful click ka size)
+learned_size = None
+SIZE_TOLERANCE = 5  # pixels ka farq allow karo
 
 ws_client = None
 cdp_ws = None
 
-# ================== WEBSOCKET (SERVER SE) ==================
+# ================== WEBSOCKET ==================
 def connect_to_server():
     global ws_client
     try:
@@ -33,13 +30,6 @@ def connect_to_server():
     except Exception as e:
         print(f"⚠️ [Bot {BOT_ID}] WS Error: {e}. Retrying in 5s...")
         return False
-
-def ensure_ws():
-    """Agar WS band ho to dobara connect karo"""
-    global ws_client
-    if ws_client is None:
-        return connect_to_server()
-    return True
 
 def send_data_to_server(data):
     global ws_client
@@ -97,18 +87,14 @@ def cdp_wait_response(ws, cmd_id, timeout=10):
     return None
 
 def ensure_cdp():
-    """Agar CDP band ho to dobara connect karo"""
     global cdp_ws
     try:
         if cdp_ws is not None:
-            # Test karo ke abhi bhi chal raha hai
             try:
                 cdp_ws.settimeout(2)
-                # Chhota sa ping test
                 cmd_id = random.randint(10000, 99999)
                 cdp_command(cdp_ws, cmd_id, "Runtime.evaluate", {
-                    "expression": "1+1",
-                    "returnByValue": True
+                    "expression": "1+1", "returnByValue": True
                 })
                 resp = cdp_wait_response(cdp_ws, cmd_id, timeout=3)
                 if resp is not None:
@@ -116,7 +102,6 @@ def ensure_cdp():
             except:
                 pass
 
-        # Naya connection banao
         print(f"🔗 [Bot {BOT_ID}] (Re)connecting to Edge CDP...")
         cdp_url = get_cdp_target()
         if not cdp_url:
@@ -130,22 +115,13 @@ def ensure_cdp():
         cdp_ws = None
         return False
 
-# ================== SCREEN WAKE-UP HELPER ==================
+# ================== SCREEN WAKE-UP ==================
 def wake_screen_and_retry():
-    """
-    Jab screen grab fail ho, to:
-    1. Screen ke center mein click karo (kisi bhi jagah)
-    2. 3 second ruko
-    3. Dobara screenshot lo
-    """
     print(f"💡 [Bot {BOT_ID}] Trying to wake screen by clicking center...")
     try:
-        # Screen ki size lo (safe method)
         sw, sh = pyautogui.size()
         center_x = sw // 2
         center_y = sh // 2
-
-        # Safe jagah click karo (screen ke center mein)
         try:
             pyautogui.moveTo(center_x, center_y, duration=0.2)
             time.sleep(0.2)
@@ -155,25 +131,22 @@ def wake_screen_and_retry():
             print(f"⚠️ [Bot {BOT_ID}] Click failed: {e}")
 
         time.sleep(3)
-
-        # Dobara try karo screenshot
         try:
             screenshot = pyautogui.screenshot()
             img = np.array(screenshot)
             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            print(f"✅ [Bot {BOT_ID}] Screen is awake! Screenshot OK.")
+            print(f"✅ [Bot {BOT_ID}] Screen is awake!")
             return img
         except Exception as e:
             print(f"⚠️ [Bot {BOT_ID}] Still no screenshot: {e}")
             return None
-
     except Exception as e:
         print(f"❌ [Bot {BOT_ID}] Wake-up failed: {e}")
         return None
 
-# ================== OPENCV: 30% AREA SCAN ==================
+# ================== OPENCV: FULL SCREEN - LARGEST OR SAME SIZE ==================
 def find_and_click_checkbox():
-    global last_success_x, last_success_y
+    global learned_size
 
     # ================== SCREENSHOT WITH RETRY ==================
     img = None
@@ -186,7 +159,6 @@ def find_and_click_checkbox():
         except Exception as e:
             print(f"⚠️ [Bot {BOT_ID}] Screenshot attempt {attempt+1} failed: {e}")
             if attempt < 2:
-                # Screen ko jagaane ki koshish
                 img = wake_screen_and_retry()
                 if img is not None:
                     break
@@ -198,31 +170,9 @@ def find_and_click_checkbox():
     # ================== DETECTION LOGIC ==================
     try:
         screen_h, screen_w = img.shape[:2]
+        print(f"🔍 [Bot {BOT_ID}] Scanning FULL screen ({screen_w}x{screen_h})...")
 
-        if last_success_x is not None and last_success_y is not None:
-            scan_w = int(screen_w * SCAN_AREA_PERCENT)
-            scan_h = int(screen_h * SCAN_AREA_PERCENT)
-            start_x = max(0, last_success_x - scan_w // 2)
-            start_y = max(0, last_success_y - scan_h // 2)
-            end_x = min(screen_w, last_success_x + scan_w // 2)
-            end_y = min(screen_h, last_success_y + scan_h // 2)
-            print(f"🧠 [Bot {BOT_ID}] Scanning 30% around last success ({last_success_x},{last_success_y})")
-        else:
-            scan_w = int(screen_w * SCAN_AREA_PERCENT)
-            scan_h = int(screen_h * SCAN_AREA_PERCENT)
-            start_x = (screen_w - scan_w) // 2
-            start_y = (screen_h - scan_h) // 2
-            end_x = start_x + scan_w
-            end_y = start_y + scan_h
-            print(f"🎯 [Bot {BOT_ID}] First scan: center 30% area")
-
-        # Crop
-        cropped = img[start_y:end_y, start_x:end_x]
-        if cropped.size == 0:
-            print(f"⚠️ [Bot {BOT_ID}] Empty crop.")
-            return False
-
-        gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -231,47 +181,89 @@ def find_and_click_checkbox():
         for cnt in contours:
             try:
                 area = cv2.contourArea(cnt)
-                if 200 < area < 1500:
+                # Square checkbox area 200-2000 pixels
+                if 200 < area < 2000:
                     peri = cv2.arcLength(cnt, True)
                     approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
 
                     if len(approx) == 4:
                         x, y, w, h = cv2.boundingRect(approx)
-                        if 15 <= w <= 45 and 15 <= h <= 45:
+                        # Size 15-60 pixels
+                        if 15 <= w <= 60 and 15 <= h <= 60:
                             aspect_ratio = float(w) / h
+                            # Square check
                             if 0.85 <= aspect_ratio <= 1.15:
                                 cx = x + w // 2
                                 cy = y + h // 2
-                                center_color = cropped[cy, cx]
+                                # Andar white color
+                                center_color = img[cy, cx]
                                 if (center_color[0] > 200 and
                                     center_color[1] > 200 and
                                     center_color[2] > 200):
-                                    size_score = 50 - abs(w - 25) * 2
                                     candidates.append({
-                                        "x": start_x + cx, "y": start_y + cy,
-                                        "w": w, "h": h, "score": size_score
+                                        "x": cx, "y": cy,
+                                        "w": w, "h": h,
+                                        "area": w * h
                                     })
-            except Exception as e:
-                continue  # Kisi ek contour ki wajah se crash nahi hoga
+            except Exception:
+                continue
 
         if not candidates:
-            print(f"⚠️ [Bot {BOT_ID}] No checkbox in scan area.")
+            print(f"⚠️ [Bot {BOT_ID}] No square found on screen.")
             return False
 
-        candidates.sort(key=lambda c: c["score"], reverse=True)
-        best = candidates[0]
+        # ================== FILTER BY LEARNED SIZE ==================
+        best = None
 
-        print(f"🎯 [Bot {BOT_ID}] BEST: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
+        if learned_size is not None:
+            # 🧠 Pichli baar ka size pata hai - usi size ka dhoondo
+            print(f"🧠 [Bot {BOT_ID}] Learned size: {learned_size}x{learned_size} (±{SIZE_TOLERANCE})")
+            matching = []
+            for c in candidates:
+                if (abs(c["w"] - learned_size) <= SIZE_TOLERANCE and
+                    abs(c["h"] - learned_size) <= SIZE_TOLERANCE):
+                    matching.append(c)
+
+            if matching:
+                # Multiple matching ho sakte - largest pick karo
+                matching.sort(key=lambda c: c["area"], reverse=True)
+                best = matching[0]
+                print(f"✅ [Bot {BOT_ID}] Found {len(matching)} candidates matching learned size")
+            else:
+                print(f"⚠️ [Bot {BOT_ID}] No candidate matches learned size. Falling back to largest.")
+                # Fallback: largest pick karo
+                candidates.sort(key=lambda c: c["area"], reverse=True)
+                best = candidates[0]
+        else:
+            # 🎯 Pehli baar: sab se bara square pick karo
+            print(f"🎯 [Bot {BOT_ID}] First time: {len(candidates)} squares found. Picking LARGEST.")
+            candidates.sort(key=lambda c: c["area"], reverse=True)
+            best = candidates[0]
+
+            # Print top 5 for debugging
+            for i, c in enumerate(candidates[:5]):
+                print(f"   #{i+1}: size={c['w']}x{c['h']} area={c['area']} pos=({c['x']},{c['y']})")
+
+        # ================== CLICK ==================
+        print(f"🎯 [Bot {BOT_ID}] CLICKING: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
 
         # Debug image
         try:
             debug_img = img.copy()
-            cv2.rectangle(debug_img, (start_x, start_y), (end_x, end_y), (0, 255, 255), 2)
-            cv2.rectangle(debug_img, (best["x"]-best["w"]//2, best["y"]-best["h"]//2),
-                          (best["x"]+best["w"]//2, best["y"]+best["h"]//2), (0, 255, 0), 3)
+            # Best (green)
+            cv2.rectangle(debug_img,
+                          (best["x"]-best["w"]//2, best["y"]-best["h"]//2),
+                          (best["x"]+best["w"]//2, best["y"]+best["h"]//2),
+                          (0, 255, 0), 3)
+            # Other candidates (blue)
+            for c in candidates:
+                if c != best:
+                    cv2.rectangle(debug_img,
+                                  (c["x"]-c["w"]//2, c["y"]-c["h"]//2),
+                                  (c["x"]+c["w"]//2, c["y"]+c["h"]//2),
+                                  (255, 0, 0), 1)
             cv2.imwrite("debug_click.png", debug_img)
-        except:
-            pass
+        except: pass
 
         # Human-like click
         cx, cy = best["x"], best["y"]
@@ -281,14 +273,19 @@ def find_and_click_checkbox():
             pyautogui.moveTo(cx, cy, duration=0.2)
             time.sleep(random.uniform(0.1, 0.3))
             pyautogui.click()
-            print(f"☑️ [Bot {BOT_ID}] Clicked at ({cx}, {cy})!")
+            print(f"☑️ [Bot {BOT_ID}] Clicked!")
         except Exception as e:
             print(f"❌ [Bot {BOT_ID}] Click failed: {e}")
             return False
 
-        last_success_x = cx
-        last_success_y = cy
-        print(f"🧠 [Bot {BOT_ID}] Learned new location: ({cx}, {cy})")
+        # 🧠 LEARN: Size save karo (agar pehli baar ho ya different ho)
+        if learned_size is None:
+            learned_size = best["w"]
+            print(f"🧠 [Bot {BOT_ID}] Learned checkbox size: {learned_size}x{learned_size}")
+        elif abs(best["w"] - learned_size) > SIZE_TOLERANCE:
+            # Naya size mila, update karo
+            learned_size = best["w"]
+            print(f"🧠 [Bot {BOT_ID}] Updated learned size: {learned_size}x{learned_size}")
 
         time.sleep(5)
         return True
@@ -311,20 +308,17 @@ def start_bot():
     cdp_wait_response(cdp_ws, cmd_id, timeout=10)
     print(f"🌐 [Bot {BOT_ID}] Page opened.")
 
-    # ================== INFINITE LOOP ==================
     while True:
         try:
             wait_sec = random.randint(40, 80)
             print(f"⏳ [Bot {BOT_ID}] Next refresh in {wait_sec} seconds...")
             time.sleep(wait_sec)
 
-            # CDP check
             if not ensure_cdp():
                 print(f"⚠️ [Bot {BOT_ID}] CDP not available. Retrying...")
                 time.sleep(10)
                 continue
 
-            # Refresh
             cmd_id += 1
             print(f"🔄 [Bot {BOT_ID}] Refreshing...")
             cdp_command(cdp_ws, cmd_id, "Page.reload", {"ignoreCache": False})
@@ -364,7 +358,6 @@ def start_bot():
 
                 time.sleep(10)
 
-                # Dobara text nikalo
                 try:
                     cmd_id += 1
                     cdp_command(cdp_ws, cmd_id, "Runtime.evaluate", {
@@ -380,14 +373,12 @@ def start_bot():
             else:
                 print(f"✅ [Bot {BOT_ID}] No CAPTCHA.")
 
-            # Data bhejo
             send_data_to_server(page_text)
 
         except KeyboardInterrupt:
             print(f"\n🛑 [Bot {BOT_ID}] Stopped by user.")
             break
         except Exception as e:
-            # 🛡️ YAHAN KOI BHI ERROR AAYE, LOOP KABHI NAHI RUKEGA
             print(f"❌ [Bot {BOT_ID}] Unexpected error: {e}")
             print(f"⏳ [Bot {BOT_ID}] Waiting 10s before retry...")
             time.sleep(10)
@@ -399,10 +390,9 @@ if __name__ == "__main__":
     print(f"🤖 Python Bot ID: {BOT_ID}")
     print(f"🔗 Forwarding to: {WS_SERVER}")
     print("🛡️ Crash-Proof Mode Enabled")
-    print("🧠 Learns location automatically")
+    print("🧠 Smart Size Learning (Largest First)")
     print("=========================================")
 
-    # 🛡️ OUTER LOOP - Agar main function crash ho jaye to bhi restart ho
     while True:
         try:
             start_bot()
