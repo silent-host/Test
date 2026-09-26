@@ -20,6 +20,8 @@ BOTS = [
         "ws_server": "ws://127.0.0.1:8080/ivas1",
         "ws_client": None,
         "cdp_ws": None,
+        "saved_pos": None,  # 🧠 (x, y) jo pehli baar success hui
+        "failed_attempts": 0,  # Kitni baar saved pos se click fail hua
     },
     {
         "id": "2",
@@ -28,12 +30,14 @@ BOTS = [
         "ws_server": "ws://127.0.0.1:8080/ivas2",
         "ws_client": None,
         "cdp_ws": None,
+        "saved_pos": None,
+        "failed_attempts": 0,
     },
 ]
 
-# ================== CHECKBOX SIZE (LEARNED) ==================
-MIN_SIZE = 30
-MAX_SIZE = 50
+MIN_SIZE = 35
+MAX_SIZE = 40
+MAX_FAILED_BEFORE_REDETECT = 3  # 3 baar fail hone par dobara detect karo
 
 # ================== WEBSOCKET ==================
 def connect_to_server(bot):
@@ -141,7 +145,7 @@ def wake_screen(bot):
 
 # ================== SCREENSHOT (THREAD-SAFE) ==================
 def take_screenshot(bot):
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             with ui_lock:
                 screenshot = pyautogui.screenshot()
@@ -150,7 +154,7 @@ def take_screenshot(bot):
             return img
         except Exception as e:
             print(f"⚠️ [Bot {bot['id']}] Screenshot {attempt+1} failed: {e}")
-            if attempt < 2:
+            if attempt < 1:
                 wake_screen(bot)
     return None
 
@@ -169,16 +173,17 @@ def safe_click(bot, cx, cy):
         print(f"❌ [Bot {bot['id']}] Click failed: {e}")
         return False
 
-# ================== FULL SCREEN DETECTION (HARDCODED SIZE) ==================
-def find_and_click_checkbox(bot):
+# ================== DETECTION (OPENCV) ==================
+def detect_checkbox_position(bot):
+    """Screenshot lo, 35-40px square dhoondo, position return karo"""
     img = take_screenshot(bot)
     if img is None:
         print(f"❌ [Bot {bot['id']}] No screenshot.")
-        return False
+        return None
 
     try:
         screen_h, screen_w = img.shape[:2]
-        print(f"🔍 [Bot {bot['id']}] Full screen scan ({screen_w}x{screen_h})...")
+        print(f"🔍 [Bot {bot['id']}] Scanning ({screen_w}x{screen_h})...")
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
@@ -188,12 +193,11 @@ def find_and_click_checkbox(bot):
         for cnt in contours:
             try:
                 area = cv2.contourArea(cnt)
-                if 800 < area < 2500:   # Area filter for 35-40px squares
+                if 800 < area < 2500:
                     peri = cv2.arcLength(cnt, True)
                     approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
                     if len(approx) == 4:
                         x, y, w, h = cv2.boundingRect(approx)
-                        # ============ HARDCODED SIZE: 35 to 40 ============
                         if MIN_SIZE <= w <= MAX_SIZE and MIN_SIZE <= h <= MAX_SIZE:
                             ar = float(w) / h
                             if 0.85 <= ar <= 1.15:
@@ -211,47 +215,86 @@ def find_and_click_checkbox(bot):
 
         if not candidates:
             print(f"⚠️ [Bot {bot['id']}] No {MIN_SIZE}-{MAX_SIZE}px square found.")
-            return False
+            return None
 
-        # ================== PICK BEST CANDIDATE ==================
-        # Agar ek se zyada mile, to screen ke center ke qareeb wala pick karo
         screen_cx = screen_w // 2
         screen_cy = screen_h // 2
         candidates.sort(key=lambda c: abs(c["x"] - screen_cx) + abs(c["y"] - screen_cy))
         best = candidates[0]
 
-        print(f"🎯 [Bot {bot['id']}] {len(candidates)} candidate(s). Best: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
-        for i, c in enumerate(candidates):
-            print(f"   #{i+1}: {c['w']}x{c['h']} area={c['area']} pos=({c['x']},{c['y']})")
+        print(f"🎯 [Bot {bot['id']}] Found {len(candidates)} candidate(s). Best: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
 
-        # ================== CLICK ==================
+        # Debug image
         try:
             debug_img = img.copy()
             cv2.rectangle(debug_img,
                           (best["x"]-best["w"]//2, best["y"]-best["h"]//2),
                           (best["x"]+best["w"]//2, best["y"]+best["h"]//2),
                           (0, 255, 0), 3)
-            # Draw scan size info
-            cv2.putText(debug_img, f"{best['w']}x{best['h']}", 
-                       (best["x"], best["y"]-20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             cv2.imwrite(f"debug_click_bot{bot['id']}.png", debug_img)
         except: pass
 
-        if safe_click(bot, best["x"], best["y"]):
-            time.sleep(5)
-            return True
-        return False
+        return (best["x"], best["y"])
 
     except Exception as e:
         print(f"❌ [Bot {bot['id']}] Detection error: {e}")
-        return False
+        return None
+
+# ================== CLOUDFLARE HANDLER (NEW LOGIC) ==================
+def handle_cloudflare(bot, page_text):
+    """
+    Smart handler:
+    1. Agar saved_pos hai -> wait 1.5s, direct click
+    2. Click ke baad check karo -> page text badla?
+    3. Agar nahi badla (3 baar) -> dobara detect karo
+    """
+    # ================== PHASE 1: SAVED POSITION ==================
+    if bot["saved_pos"] is not None:
+        x, y = bot["saved_pos"]
+        print(f"🧠 [Bot {bot['id']}] Using SAVED position: ({x}, {y})")
+
+        # 1.5 second wait (Cloudflare loader ke liye)
+        time.sleep(1.5)
+
+        # Direct click
+        if safe_click(bot, x, y):
+            time.sleep(4)
+            return True  # Assume successful (agar fail hua to next cycle pata chalega)
+
+    # ================== PHASE 2: FRESH DETECTION ==================
+    print(f"🔍 [Bot {bot['id']}] No saved position. Detecting via OpenCV...")
+
+    for attempt in range(8):
+        pos = detect_checkbox_position(bot)
+        if pos:
+            x, y = pos
+            print(f"🎯 [Bot {bot['id']}] Detected: ({x}, {y})")
+
+            # 1.5 second wait before click
+            time.sleep(1.5)
+
+            if safe_click(bot, x, y):
+                # 🧠 SAVE the position!
+                bot["saved_pos"] = (x, y)
+                bot["failed_attempts"] = 0
+                print(f"🧠 [Bot {bot['id']}] Position SAVED: ({x}, {y})")
+                time.sleep(5)
+                return True
+            else:
+                print(f"⚠️ [Bot {bot['id']}] Click failed. Retrying...")
+        else:
+            print(f"⏳ [Bot {bot['id']}] Attempt {attempt+1}: Box not ready, waiting...")
+        time.sleep(1.5)
+
+    print(f"❌ [Bot {bot['id']}] Could not detect/click after 8 attempts.")
+    return False
 
 # ================== BOT THREAD ==================
 def bot_thread(bot):
     print(f"=========================================")
     print(f"🤖 [Bot {bot['id']}] Starting (port {bot['edge_port']})")
     print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
+    print(f"🧠 Position Memory ENABLED")
     print(f"=========================================")
 
     for _ in range(5):
@@ -260,7 +303,7 @@ def bot_thread(bot):
 
     for _ in range(10):
         if ensure_cdp(bot): break
-        print(f"⏳ [Bot {bot['id']}] Waiting for Edge on port {bot['edge_port']}...")
+        print(f"⏳ [Bot {bot['id']}] Waiting for Edge...")
         time.sleep(5)
 
     if not bot["cdp_ws"]:
@@ -274,7 +317,7 @@ def bot_thread(bot):
 
     while True:
         try:
-            wait_sec = random.randint(40, 80)
+            wait_sec = random.randint(120, 240)  # 2-4 minutes
             print(f"⏳ [Bot {bot['id']}] Next refresh in {wait_sec}s...")
             time.sleep(wait_sec)
 
@@ -288,6 +331,7 @@ def bot_thread(bot):
             cdp_wait_response(bot["cdp_ws"], cmd_id, timeout=15)
             time.sleep(6)
 
+            # Text nikalo
             page_text = ""
             try:
                 cmd_id += 1
@@ -302,20 +346,20 @@ def bot_thread(bot):
             except Exception as e:
                 print(f"⚠️ [Bot {bot['id']}] Text error: {e}")
 
+            # Cloudflare detect
             if ("Performing security verification" in page_text or
                 "Verify you are human" in page_text or
                 "malicious bots" in page_text):
+
                 print(f"🚨 [Bot {bot['id']}] CLOUDFLARE DETECTED!")
 
-                for attempt in range(5):
-                    try:
-                        if find_and_click_checkbox(bot): break
-                    except Exception as e:
-                        print(f"⚠️ [Bot {bot['id']}] Click error: {e}")
-                    time.sleep(3)
+                # Handle it
+                handle_cloudflare(bot, page_text)
 
-                time.sleep(10)
+                # Wait for verification
+                time.sleep(8)
 
+                # Check karo success hui ya nahi
                 try:
                     cmd_id += 1
                     cdp_command(bot["cdp_ws"], cmd_id, "Runtime.evaluate", {
@@ -325,10 +369,29 @@ def bot_thread(bot):
                     response = cdp_wait_response(bot["cdp_ws"], cmd_id, timeout=10)
                     if response and "result" in response:
                         result = response["result"].get("result", {})
-                        page_text = result.get("value", "")
-                except: pass
+                        new_text = result.get("value", "")
+
+                        # Check: captcha gaya ya nahi?
+                        if ("Performing security verification" in new_text or
+                            "Verify you are human" in new_text):
+
+                            bot["failed_attempts"] += 1
+                            print(f"⚠️ [Bot {bot['id']}] CAPTCHA STILL THERE. Failed attempts: {bot['failed_attempts']}")
+
+                            # 3 baar fail hone par saved position delete karo
+                            if bot["failed_attempts"] >= MAX_FAILED_BEFORE_REDETECT:
+                                print(f"🗑️ [Bot {bot['id']}] Clearing saved position (3 fails). Will re-detect.")
+                                bot["saved_pos"] = None
+                                bot["failed_attempts"] = 0
+                        else:
+                            print(f"✅ [Bot {bot['id']}] CAPTCHA SOLVED!")
+                            bot["failed_attempts"] = 0
+                            page_text = new_text
+                except Exception as e:
+                    print(f"⚠️ [Bot {bot['id']}] Verification check error: {e}")
             else:
                 print(f"✅ [Bot {bot['id']}] No CAPTCHA.")
+                bot["failed_attempts"] = 0  # Reset
 
             send_data_to_server(bot, page_text)
 
@@ -341,9 +404,11 @@ def bot_thread(bot):
 if __name__ == "__main__":
     print("=========================================")
     print("🤖 MULTI-BOT (2 Edge Browsers)")
-    print(f"📏 HARDCODED SIZE: {MIN_SIZE}-{MAX_SIZE}px")
-    print("🎯 Full screen scan (matches Cloudflare only)")
-    print("🛡️ Crash-Proof with Thread Lock")
+    print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
+    print("🧠 SMART: Position Memory + Auto-Fallback")
+    print("🎯 Pehli baar: OpenCV detect → Save position")
+    print("⚡ Agli baar: Direct click (no screenshot needed)")
+    print("🔄 3 fails hone par: Auto re-detect")
     print("=========================================")
 
     threads = []
