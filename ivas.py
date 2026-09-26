@@ -18,7 +18,6 @@ BOTS = [
         "edge_port": "9222",
         "target_url": "https://www.ivasms.com/portal/live/my_sms",
         "ws_server": "ws://127.0.0.1:8080/ivas1",
-        "learned_size": None,
         "ws_client": None,
         "cdp_ws": None,
     },
@@ -27,13 +26,14 @@ BOTS = [
         "edge_port": "9223",
         "target_url": "https://www.ivasms.com/portal/live/my_sms",
         "ws_server": "ws://127.0.0.1:8080/ivas2",
-        "learned_size": None,
         "ws_client": None,
         "cdp_ws": None,
     },
 ]
 
-SIZE_TOLERANCE = 5
+# ================== CHECKBOX SIZE (LEARNED) ==================
+MIN_SIZE = 30
+MAX_SIZE = 50
 
 # ================== WEBSOCKET ==================
 def connect_to_server(bot):
@@ -169,9 +169,8 @@ def safe_click(bot, cx, cy):
         print(f"❌ [Bot {bot['id']}] Click failed: {e}")
         return False
 
-# ================== FULL SCREEN DETECTION ==================
+# ================== FULL SCREEN DETECTION (HARDCODED SIZE) ==================
 def find_and_click_checkbox(bot):
-    """FULL screen scan karo, largest square (ya learned size) dhoondo, click karo"""
     img = take_screenshot(bot)
     if img is None:
         print(f"❌ [Bot {bot['id']}] No screenshot.")
@@ -189,12 +188,13 @@ def find_and_click_checkbox(bot):
         for cnt in contours:
             try:
                 area = cv2.contourArea(cnt)
-                if 200 < area < 2000:
+                if 800 < area < 2500:   # Area filter for 35-40px squares
                     peri = cv2.arcLength(cnt, True)
                     approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
                     if len(approx) == 4:
                         x, y, w, h = cv2.boundingRect(approx)
-                        if 15 <= w <= 60 and 15 <= h <= 60:
+                        # ============ HARDCODED SIZE: 35 to 40 ============
+                        if MIN_SIZE <= w <= MAX_SIZE and MIN_SIZE <= h <= MAX_SIZE:
                             ar = float(w) / h
                             if 0.85 <= ar <= 1.15:
                                 cx = x + w // 2
@@ -210,47 +210,35 @@ def find_and_click_checkbox(bot):
             except: continue
 
         if not candidates:
-            print(f"⚠️ [Bot {bot['id']}] No square found.")
+            print(f"⚠️ [Bot {bot['id']}] No {MIN_SIZE}-{MAX_SIZE}px square found.")
             return False
 
-        # ================== SIZE FILTER ==================
-        best = None
-        if bot["learned_size"] is not None:
-            print(f"🧠 [Bot {bot['id']}] Learned size: {bot['learned_size']}px")
-            matching = [c for c in candidates
-                       if abs(c["w"] - bot["learned_size"]) <= SIZE_TOLERANCE
-                       and abs(c["h"] - bot["learned_size"]) <= SIZE_TOLERANCE]
-            if matching:
-                matching.sort(key=lambda c: c["area"], reverse=True)
-                best = matching[0]
-                print(f"✅ [Bot {bot['id']}] {len(matching)} match(es).")
-            else:
-                print(f"⚠️ [Bot {bot['id']}] No size match. Largest pick.")
-                candidates.sort(key=lambda c: c["area"], reverse=True)
-                best = candidates[0]
-        else:
-            print(f"🎯 [Bot {bot['id']}] First time: {len(candidates)} squares. Largest pick.")
-            candidates.sort(key=lambda c: c["area"], reverse=True)
-            best = candidates[0]
-            for i, c in enumerate(candidates[:5]):
-                print(f"   #{i+1}: {c['w']}x{c['h']} area={c['area']} pos=({c['x']},{c['y']})")
+        # ================== PICK BEST CANDIDATE ==================
+        # Agar ek se zyada mile, to screen ke center ke qareeb wala pick karo
+        screen_cx = screen_w // 2
+        screen_cy = screen_h // 2
+        candidates.sort(key=lambda c: abs(c["x"] - screen_cx) + abs(c["y"] - screen_cy))
+        best = candidates[0]
+
+        print(f"🎯 [Bot {bot['id']}] {len(candidates)} candidate(s). Best: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
+        for i, c in enumerate(candidates):
+            print(f"   #{i+1}: {c['w']}x{c['h']} area={c['area']} pos=({c['x']},{c['y']})")
 
         # ================== CLICK ==================
-        print(f"🎯 [Bot {bot['id']}] CLICK: ({best['x']}, {best['y']}) {best['w']}x{best['h']}")
-
         try:
             debug_img = img.copy()
             cv2.rectangle(debug_img,
                           (best["x"]-best["w"]//2, best["y"]-best["h"]//2),
                           (best["x"]+best["w"]//2, best["y"]+best["h"]//2),
                           (0, 255, 0), 3)
+            # Draw scan size info
+            cv2.putText(debug_img, f"{best['w']}x{best['h']}", 
+                       (best["x"], best["y"]-20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             cv2.imwrite(f"debug_click_bot{bot['id']}.png", debug_img)
         except: pass
 
         if safe_click(bot, best["x"], best["y"]):
-            if bot["learned_size"] is None or abs(best["w"] - bot["learned_size"]) > SIZE_TOLERANCE:
-                bot["learned_size"] = best["w"]
-                print(f"🧠 [Bot {bot['id']}] Learned size: {bot['learned_size']}px")
             time.sleep(5)
             return True
         return False
@@ -263,6 +251,7 @@ def find_and_click_checkbox(bot):
 def bot_thread(bot):
     print(f"=========================================")
     print(f"🤖 [Bot {bot['id']}] Starting (port {bot['edge_port']})")
+    print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
     print(f"=========================================")
 
     for _ in range(5):
@@ -352,7 +341,8 @@ def bot_thread(bot):
 if __name__ == "__main__":
     print("=========================================")
     print("🤖 MULTI-BOT (2 Edge Browsers)")
-    print("📸 FULL SCREEN SCAN (top/bottom split OK)")
+    print(f"📏 HARDCODED SIZE: {MIN_SIZE}-{MAX_SIZE}px")
+    print("🎯 Full screen scan (matches Cloudflare only)")
     print("🛡️ Crash-Proof with Thread Lock")
     print("=========================================")
 
