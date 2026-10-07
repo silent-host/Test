@@ -20,22 +20,22 @@ BOTS = [
         "ws_server": "ws://127.0.0.1:8080/ivas1",
         "ws_client": None,
         "cdp_ws": None,
-        "saved_pos": None,  # 🧠 (x, y) jo pehli baar success hui
+        "saved_pos": None,  # (x, y) jo pehli baar success hui
         "failed_attempts": 0,  # Kitni baar saved pos se click fail hua
     },
-    {
-        "id": "2",
-        "edge_port": "9223",
-        "target_url": "https://www.ivasms.com/portal/live/my_sms",
-        "ws_server": "ws://127.0.0.1:8080/ivas2",
-        "ws_client": None,
-        "cdp_ws": None,
-        "saved_pos": None,
-        "failed_attempts": 0,
-    },
+    # {
+    #     "id": "2",
+    #     "edge_port": "9223",
+    #     "target_url": "https://www.ivasms.com/portal/live/my_sms",
+    #     "ws_server": "ws://127.0.0.1:8080/ivas2",
+    #     "ws_client": None,
+    #     "cdp_ws": None,
+    #     "saved_pos": None,
+    #     "failed_attempts": 0,
+    # },
 ]
 
-MIN_SIZE = 35
+MIN_SIZE = 24
 MAX_SIZE = 40
 MAX_FAILED_BEFORE_REDETECT = 3  # 3 baar fail hone par dobara detect karo
 
@@ -175,7 +175,7 @@ def safe_click(bot, cx, cy):
 
 # ================== DETECTION (OPENCV) ==================
 def detect_checkbox_position(bot):
-    """Screenshot lo, 35-40px square dhoondo, position return karo"""
+    """Screenshot lo, 24-36px square dhoondo, position return karo"""
     img = take_screenshot(bot)
     if img is None:
         print(f"❌ [Bot {bot['id']}] No screenshot.")
@@ -186,14 +186,18 @@ def detect_checkbox_position(bot):
         print(f"🔍 [Bot {bot['id']}] Scanning ({screen_w}x{screen_h})...")
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(blurred, 50, 150)
+
+        # RETR_TREE taake container ke andar wala actual checkbox pakra ja sake
+        contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
         for cnt in contours:
             try:
                 area = cv2.contourArea(cnt)
-                if 800 < area < 2500:
+                # Cloudflare checkbox aam tor par 26px se 32px (Area: 550 se 1500) hota hai
+                if 550 < area < 1500:
                     peri = cv2.arcLength(cnt, True)
                     approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
                     if len(approx) == 4:
@@ -204,9 +208,10 @@ def detect_checkbox_position(bot):
                                 cx = x + w // 2
                                 cy = y + h // 2
                                 center_color = img[cy, cx]
-                                if (center_color[0] > 200 and
-                                    center_color[1] > 200 and
-                                    center_color[2] > 200):
+                                # Checkbox ka center white/bright hona chahiye
+                                if (center_color[0] > 190 and
+                                    center_color[1] > 190 and
+                                    center_color[2] > 190):
                                     candidates.append({
                                         "x": cx, "y": cy,
                                         "w": w, "h": h, "area": w * h
@@ -217,6 +222,7 @@ def detect_checkbox_position(bot):
             print(f"⚠️ [Bot {bot['id']}] No {MIN_SIZE}-{MAX_SIZE}px square found.")
             return None
 
+        # Screen center ke qareeb tareen candidate select karo
         screen_cx = screen_w // 2
         screen_cy = screen_h // 2
         candidates.sort(key=lambda c: abs(c["x"] - screen_cx) + abs(c["y"] - screen_cy))
@@ -224,12 +230,12 @@ def detect_checkbox_position(bot):
 
         print(f"🎯 [Bot {bot['id']}] Found {len(candidates)} candidate(s). Best: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
 
-        # Debug image
+        # Debug image save karega tasdeeq ke liye
         try:
             debug_img = img.copy()
             cv2.rectangle(debug_img,
-                          (best["x"]-best["w"]//2, best["y"]-best["h"]//2),
-                          (best["x"]+best["w"]//2, best["y"]+best["h"]//2),
+                          (best["x"] - best["w"] // 2, best["y"] - best["h"] // 2),
+                          (best["x"] + best["w"] // 2, best["y"] + best["h"] // 2),
                           (0, 255, 0), 3)
             cv2.imwrite(f"debug_click_bot{bot['id']}.png", debug_img)
         except: pass
@@ -240,7 +246,7 @@ def detect_checkbox_position(bot):
         print(f"❌ [Bot {bot['id']}] Detection error: {e}")
         return None
 
-# ================== CLOUDFLARE HANDLER (NEW LOGIC) ==================
+# ================== CLOUDFLARE HANDLER ==================
 def handle_cloudflare(bot, page_text):
     """
     Smart handler:
@@ -259,7 +265,7 @@ def handle_cloudflare(bot, page_text):
         # Direct click
         if safe_click(bot, x, y):
             time.sleep(4)
-            return True  # Assume successful (agar fail hua to next cycle pata chalega)
+            return True  # Assume successful
 
     # ================== PHASE 2: FRESH DETECTION ==================
     print(f"🔍 [Bot {bot['id']}] No saved position. Detecting via OpenCV...")
@@ -274,7 +280,7 @@ def handle_cloudflare(bot, page_text):
             time.sleep(1.5)
 
             if safe_click(bot, x, y):
-                # 🧠 SAVE the position!
+                # Save position for next cycles
                 bot["saved_pos"] = (x, y)
                 bot["failed_attempts"] = 0
                 print(f"🧠 [Bot {bot['id']}] Position SAVED: ({x}, {y})")
@@ -403,7 +409,7 @@ def bot_thread(bot):
 # ================== MAIN ==================
 if __name__ == "__main__":
     print("=========================================")
-    print("🤖 MULTI-BOT (2 Edge Browsers)")
+    print("🤖 MULTI-BOT (Edge Browser Automation)")
     print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
     print("🧠 SMART: Position Memory + Auto-Fallback")
     print("🎯 Pehli baar: OpenCV detect → Save position")
