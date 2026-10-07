@@ -39,6 +39,19 @@ MIN_SIZE = 24
 MAX_SIZE = 40
 MAX_FAILED_BEFORE_REDETECT = 3  # 3 baar fail hone par dobara detect karo
 
+# ================== KEEP ALIVE (ANTI-IDLE) ==================
+def keep_screen_alive():
+    """Har 45 second baad mouse ko move karega taake RDP screen lock ya idle na ho"""
+    while True:
+        try:
+            time.sleep(45)
+            with ui_lock:
+                pyautogui.moveRel(1, 1, duration=0.1)
+                pyautogui.moveRel(-1, -1, duration=0.1)
+                pyautogui.press('shift')
+        except Exception:
+            pass
+
 # ================== WEBSOCKET ==================
 def connect_to_server(bot):
     try:
@@ -87,7 +100,8 @@ def cdp_command(ws, cmd_id, method, params=None):
         if params:
             msg["params"] = params
         ws.send(json.dumps(msg))
-    except: pass
+    except Exception:
+        pass
 
 def cdp_wait_response(ws, cmd_id, timeout=10):
     start = time.time()
@@ -98,7 +112,8 @@ def cdp_wait_response(ws, cmd_id, timeout=10):
             data = json.loads(result)
             if data.get("id") == cmd_id:
                 return data
-        except: continue
+        except Exception:
+            continue
     return None
 
 def ensure_cdp(bot):
@@ -113,7 +128,8 @@ def ensure_cdp(bot):
                 resp = cdp_wait_response(bot["cdp_ws"], cmd_id, timeout=3)
                 if resp is not None:
                     return True
-            except: pass
+            except Exception:
+                pass
 
         print(f"🔗 [Bot {bot['id']}] (Re)connecting to Edge (port {bot['edge_port']})...")
         cdp_url = get_cdp_target(bot)
@@ -138,15 +154,26 @@ def wake_screen(bot):
             pyautogui.moveTo(cx, cy, duration=0.2)
             time.sleep(0.2)
             pyautogui.click()
-        except: pass
+        except Exception:
+            pass
         time.sleep(3)
         return True
-    except: return False
+    except Exception:
+        return False
 
 # ================== SCREENSHOT (THREAD-SAFE) ==================
 def take_screenshot(bot):
     for attempt in range(2):
         try:
+            # Edge browser ko foreground / samne lane ke liye CDP call
+            if bot.get("cdp_ws"):
+                try:
+                    cmd_id = random.randint(10000, 99999)
+                    cdp_command(bot["cdp_ws"], cmd_id, "Page.bringToFront")
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+
             with ui_lock:
                 screenshot = pyautogui.screenshot()
                 img = np.array(screenshot)
@@ -196,7 +223,7 @@ def detect_checkbox_position(bot):
         for cnt in contours:
             try:
                 area = cv2.contourArea(cnt)
-                # Cloudflare checkbox aam tor par 26px se 32px (Area: 550 se 1500) hota hai
+                # Cloudflare checkbox 26px se 32px (Area: 550 se 1500) hota hai
                 if 550 < area < 1500:
                     peri = cv2.arcLength(cnt, True)
                     approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
@@ -208,7 +235,7 @@ def detect_checkbox_position(bot):
                                 cx = x + w // 2
                                 cy = y + h // 2
                                 center_color = img[cy, cx]
-                                # Checkbox ka center white/bright hona chahiye
+                                # Checkbox ka center bright/white hona chahiye
                                 if (center_color[0] > 190 and
                                     center_color[1] > 190 and
                                     center_color[2] > 190):
@@ -216,7 +243,8 @@ def detect_checkbox_position(bot):
                                         "x": cx, "y": cy,
                                         "w": w, "h": h, "area": w * h
                                     })
-            except: continue
+            except Exception:
+                continue
 
         if not candidates:
             print(f"⚠️ [Bot {bot['id']}] No {MIN_SIZE}-{MAX_SIZE}px square found.")
@@ -238,7 +266,8 @@ def detect_checkbox_position(bot):
                           (best["x"] + best["w"] // 2, best["y"] + best["h"] // 2),
                           (0, 255, 0), 3)
             cv2.imwrite(f"debug_click_bot{bot['id']}.png", debug_img)
-        except: pass
+        except Exception:
+            pass
 
         return (best["x"], best["y"])
 
@@ -259,13 +288,11 @@ def handle_cloudflare(bot, page_text):
         x, y = bot["saved_pos"]
         print(f"🧠 [Bot {bot['id']}] Using SAVED position: ({x}, {y})")
 
-        # 1.5 second wait (Cloudflare loader ke liye)
         time.sleep(1.5)
 
-        # Direct click
         if safe_click(bot, x, y):
             time.sleep(4)
-            return True  # Assume successful
+            return True
 
     # ================== PHASE 2: FRESH DETECTION ==================
     print(f"🔍 [Bot {bot['id']}] No saved position. Detecting via OpenCV...")
@@ -276,11 +303,9 @@ def handle_cloudflare(bot, page_text):
             x, y = pos
             print(f"🎯 [Bot {bot['id']}] Detected: ({x}, {y})")
 
-            # 1.5 second wait before click
             time.sleep(1.5)
 
             if safe_click(bot, x, y):
-                # Save position for next cycles
                 bot["saved_pos"] = (x, y)
                 bot["failed_attempts"] = 0
                 print(f"🧠 [Bot {bot['id']}] Position SAVED: ({x}, {y})")
@@ -362,7 +387,6 @@ def bot_thread(bot):
                 # Handle it
                 handle_cloudflare(bot, page_text)
 
-                # Wait for verification
                 time.sleep(8)
 
                 # Check karo success hui ya nahi
@@ -377,14 +401,12 @@ def bot_thread(bot):
                         result = response["result"].get("result", {})
                         new_text = result.get("value", "")
 
-                        # Check: captcha gaya ya nahi?
                         if ("Performing security verification" in new_text or
                             "Verify you are human" in new_text):
 
                             bot["failed_attempts"] += 1
                             print(f"⚠️ [Bot {bot['id']}] CAPTCHA STILL THERE. Failed attempts: {bot['failed_attempts']}")
 
-                            # 3 baar fail hone par saved position delete karo
                             if bot["failed_attempts"] >= MAX_FAILED_BEFORE_REDETECT:
                                 print(f"🗑️ [Bot {bot['id']}] Clearing saved position (3 fails). Will re-detect.")
                                 bot["saved_pos"] = None
@@ -397,7 +419,7 @@ def bot_thread(bot):
                     print(f"⚠️ [Bot {bot['id']}] Verification check error: {e}")
             else:
                 print(f"✅ [Bot {bot['id']}] No CAPTCHA.")
-                bot["failed_attempts"] = 0  # Reset
+                bot["failed_attempts"] = 0
 
             send_data_to_server(bot, page_text)
 
@@ -409,14 +431,20 @@ def bot_thread(bot):
 # ================== MAIN ==================
 if __name__ == "__main__":
     print("=========================================")
-    print("🤖 MULTI-BOT (Edge Browser Automation)")
+    print("🤖 MULTI-BOT (Edge Automation)")
     print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
     print("🧠 SMART: Position Memory + Auto-Fallback")
     print("🎯 Pehli baar: OpenCV detect → Save position")
     print("⚡ Agli baar: Direct click (no screenshot needed)")
     print("🔄 3 fails hone par: Auto re-detect")
+    print("💡 Anti-Idle Screen Protector: ENABLED")
     print("=========================================")
 
+    # 1. Anti-Idle Thread start taake screen kabhi sleep/lock na ho
+    idle_thread = threading.Thread(target=keep_screen_alive, daemon=True)
+    idle_thread.start()
+
+    # 2. Bots Threads
     threads = []
     for bot in BOTS:
         t = threading.Thread(target=bot_thread, args=(bot,), daemon=True)
