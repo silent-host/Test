@@ -200,10 +200,11 @@ def safe_click(bot, cx, cy):
         return False
 
 # ================== DETECTION (OPENCV SMART MATCHER) ==================
+# ================== DETECTION (OPENCV SMART MATCHER) ==================
 def detect_checkbox_position(bot):
     """
-    1. Square checkbox dhoondo (Dark border + Pure White center + Verify text nearby)
-    2. Backup: Cloudflare Orange Cloud dhoondo aur uske left pe checkbox click karo
+    1. Square checkbox dhoondo (4 corners, non-circular, Y > 500 zone)
+    2. Alphabet 'o' ya circular shapes ko filter out karo
     """
     img = take_screenshot(bot)
     if img is None:
@@ -214,52 +215,62 @@ def detect_checkbox_position(bot):
         screen_h, screen_w = img.shape[:2]
         print(f"🔍 [Bot {bot['id']}] Scanning ({screen_w}x{screen_h})...")
 
-        # ------------------ METHOD 1: SQUARE CHECKBOX DETECTION ------------------
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # Checkbox ka border dark grey hota hai (40 se 135 ke darmiyan)
-        border_mask = cv2.inRange(gray, 40, 135)
+        # Border mask (dark borders)
+        border_mask = cv2.inRange(gray, 40, 140)
         contours, _ = cv2.findContours(border_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
         for cnt in contours:
             try:
+                area = cv2.contourArea(cnt)
+                peri = cv2.arcLength(cnt, True)
+                if peri == 0:
+                    continue
+
+                # Circularity: Circle/O ka circularity score 0.85+ hota hai, Square ka 0.78 ke qareeb hota hai
+                circularity = 4 * np.pi * (area / (peri * peri))
+
+                # Approx polygon corners check (Square ke 4 corners honge, O ke 6 se zyada)
+                approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+
                 x, y, w, h = cv2.boundingRect(cnt)
+
+                # Filter 1: Size 24px se 38px
                 if MIN_SIZE <= w <= MAX_SIZE and MIN_SIZE <= h <= MAX_SIZE:
                     ar = float(w) / h
-                    # Bilkul square (chakor) hona chahiye (0.88 se 1.12)
-                    if 0.88 <= ar <= 1.12:
+                    # Filter 2: Perfect Square ratio (0.90 se 1.10)
+                    if 0.90 <= ar <= 1.10:
                         cx = x + w // 2
                         cy = y + h // 2
-                        
-                        # Taskbar ya screen boundaries ko exclude karo
-                        if cx < 60 or cy < 100 or cy > screen_h - 60:
+
+                        # Filter 3: Y-Coordinate ZONE! 
+                        # 'bots' ka O (Y=359) par hai. Checkbox hamesha Y > 500 par hota hai
+                        if cy < 500 or cx > 900 or cx < 60:
                             continue
 
-                        # Checkbox ke andar center color safaid (pure white) hona chahiye
-                        center_color = img[cy, cx]
-                        if center_color[0] > 220 and center_color[1] > 220 and center_color[2] > 220:
-                            
-                            # Tasdeeq: Checkbox ke dayen taraf (text area me) dark pixels hone chahiye
-                            text_sample_x = min(screen_w - 5, cx + 45)
-                            text_color = gray[cy, text_sample_x]
-                            has_text_nearby = (text_color < 120)  # Dark text present
+                        # Filter 4: Gol 'O' ko reject karo (Corners 4 hon aur shape gol na ho)
+                        if len(approx) > 5 or circularity > 0.86:
+                            continue
 
+                        # Filter 5: Center color pure white hona chahiye
+                        center_color = img[cy, cx]
+                        if center_color[0] > 215 and center_color[1] > 215 and center_color[2] > 215:
                             candidates.append({
                                 "x": cx, "y": cy,
                                 "w": w, "h": h,
-                                "has_text": has_text_nearby
+                                "area": area
                             })
             except Exception:
                 continue
 
-        # Agar candidates milein to jiske sath text verify ho usko pehle lo
         if candidates:
-            candidates.sort(key=lambda c: (not c["has_text"], c["x"]))
+            # Checkbox aam tor par screen ke left hissay (X: 80 se 150) me hota hai
+            candidates.sort(key=lambda c: c["x"])
             best = candidates[0]
-            print(f"🎯 [Bot {bot['id']}] Square Box Found: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
+            print(f"🎯 [Bot {bot['id']}] Real Square Box Found: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
 
-            # Debug image save
             try:
                 debug_img = img.copy()
                 cv2.rectangle(debug_img,
@@ -272,11 +283,9 @@ def detect_checkbox_position(bot):
 
             return (best["x"], best["y"])
 
-        # ------------------ METHOD 2: CLOUDFLARE ORANGE CLOUD DETECTOR ------------------
-        print(f"⚠️ [Bot {bot['id']}] Box border not isolated, scanning for Cloudflare Orange Logo...")
+        # ------------------ BACKUP: ORANGE LOGO DETECTION ------------------
+        print(f"⚠️ [Bot {bot['id']}] Box not detected directly, checking Orange Cloud...")
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        
-        # Orange cloud color range
         lower_orange = np.array([10, 140, 160])
         upper_orange = np.array([25, 255, 255])
         orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
@@ -286,20 +295,14 @@ def detect_checkbox_position(bot):
             area = cv2.contourArea(cc)
             if 300 < area < 2500:
                 cx, cy, cw, ch = cv2.boundingRect(cc)
-                
-                # Sirf Browser wale hissay (X < 900) me search karein, Desktop par nahi
-                if cx > 900:
-                    continue
-
-                # Cloud logo mil gaya, checkbox is se taqreeban 185px left par hota hai
-                target_box_x = cx - 185
-                target_box_y = cy + ch // 2 + 5
-
-                if 60 < target_box_x < 900:
-                    print(f"🎯 [Bot {bot['id']}] Located via Orange Cloud! Target Box: ({target_box_x}, {target_box_y})")
+                # Sirf Browser zone (X < 900 aur Y > 500) me Cloudflare logo dhoondo
+                if cx < 900 and cy > 500:
+                    target_box_x = cx - 185
+                    target_box_y = cy + ch // 2 + 5
+                    print(f"🎯 [Bot {bot['id']}] Located via Cloudflare Logo! Box: ({target_box_x}, {target_box_y})")
                     return (target_box_x, target_box_y)
 
-        print(f"⚠️ [Bot {bot['id']}] Neither Box nor Orange Logo found.")
+        print(f"⚠️ [Bot {bot['id']}] No valid checkbox found in widget area.")
         return None
 
     except Exception as e:
