@@ -36,7 +36,7 @@ BOTS = [
 ]
 
 MIN_SIZE = 24
-MAX_SIZE = 40
+MAX_SIZE = 38
 MAX_FAILED_BEFORE_REDETECT = 3  # 3 baar fail hone par dobara detect karo
 
 # ================== KEEP ALIVE (ANTI-IDLE) ==================
@@ -165,7 +165,6 @@ def wake_screen(bot):
 def take_screenshot(bot):
     for attempt in range(2):
         try:
-            # Edge browser ko foreground / samne lane ke liye CDP call
             if bot.get("cdp_ws"):
                 try:
                     cmd_id = random.randint(10000, 99999)
@@ -200,10 +199,12 @@ def safe_click(bot, cx, cy):
         print(f"❌ [Bot {bot['id']}] Click failed: {e}")
         return False
 
-# ================== DETECTION (OPENCV) ==================
-# ================== DETECTION (OPENCV) ==================
+# ================== DETECTION (OPENCV SMART MATCHER) ==================
 def detect_checkbox_position(bot):
-    """Screenshot lo, 24-36px square dhoondo, position return karo"""
+    """
+    1. Square checkbox dhoondo (Dark border + Pure White center + Verify text nearby)
+    2. Backup: Cloudflare Orange Cloud dhoondo aur uske left pe checkbox click karo
+    """
     img = take_screenshot(bot)
     if img is None:
         print(f"❌ [Bot {bot['id']}] No screenshot.")
@@ -213,67 +214,88 @@ def detect_checkbox_position(bot):
         screen_h, screen_w = img.shape[:2]
         print(f"🔍 [Bot {bot['id']}] Scanning ({screen_w}x{screen_h})...")
 
+        # ------------------ METHOD 1: SQUARE CHECKBOX DETECTION ------------------
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blurred, 50, 150)
-
-        contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Checkbox ka border dark grey hota hai (40 se 135 ke darmiyan)
+        border_mask = cv2.inRange(gray, 40, 135)
+        contours, _ = cv2.findContours(border_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
         for cnt in contours:
             try:
-                area = cv2.contourArea(cnt)
-                if 550 < area < 1500:
-                    peri = cv2.arcLength(cnt, True)
-                    approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-                    if len(approx) == 4:
-                        x, y, w, h = cv2.boundingRect(approx)
-                        if MIN_SIZE <= w <= MAX_SIZE and MIN_SIZE <= h <= MAX_SIZE:
-                            ar = float(w) / h
-                            if 0.85 <= ar <= 1.15:
-                                cx = x + w // 2
-                                cy = y + h // 2
-                                
-                                # Filter 1: Border clicks avoid karein (X kam az kam 75px se bara ho)
-                                if cx < 75 or cy < 100:
-                                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                if MIN_SIZE <= w <= MAX_SIZE and MIN_SIZE <= h <= MAX_SIZE:
+                    ar = float(w) / h
+                    # Bilkul square (chakor) hona chahiye (0.88 se 1.12)
+                    if 0.88 <= ar <= 1.12:
+                        cx = x + w // 2
+                        cy = y + h // 2
+                        
+                        # Taskbar ya screen boundaries ko exclude karo
+                        if cx < 60 or cy < 100 or cy > screen_h - 60:
+                            continue
 
-                                center_color = img[cy, cx]
-                                if (center_color[0] > 190 and
-                                    center_color[1] > 190 and
-                                    center_color[2] > 190):
-                                    candidates.append({
-                                        "x": cx, "y": cy,
-                                        "w": w, "h": h, "area": w * h
-                                    })
+                        # Checkbox ke andar center color safaid (pure white) hona chahiye
+                        center_color = img[cy, cx]
+                        if center_color[0] > 220 and center_color[1] > 220 and center_color[2] > 220:
+                            
+                            # Tasdeeq: Checkbox ke dayen taraf (text area me) dark pixels hone chahiye
+                            text_sample_x = min(screen_w - 5, cx + 45)
+                            text_color = gray[cy, text_sample_x]
+                            has_text_nearby = (text_color < 120)  # Dark text present
+
+                            candidates.append({
+                                "x": cx, "y": cy,
+                                "w": w, "h": h,
+                                "has_text": has_text_nearby
+                            })
             except Exception:
                 continue
 
-        if not candidates:
-            print(f"⚠️ [Bot {bot['id']}] No {MIN_SIZE}-{MAX_SIZE}px square found.")
-            return None
-
-        # Filter 2: Cloudflare Widget area aam tor par (X: 80 se 160) aur (Y: 380 se 500) me hota hai
-        # Sab se pehle widget area wale box ko tarjeeh do
-        widget_candidates = [c for c in candidates if 80 <= c["x"] <= 180 and 350 <= c["y"] <= 550]
-        if widget_candidates:
-            best = widget_candidates[0]
-        else:
+        # Agar candidates milein to jiske sath text verify ho usko pehle lo
+        if candidates:
+            candidates.sort(key=lambda c: (not c["has_text"], c["x"]))
             best = candidates[0]
+            print(f"🎯 [Bot {bot['id']}] Square Box Found: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
 
-        print(f"🎯 [Bot {bot['id']}] Found {len(candidates)} candidate(s). Selected Best: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
+            # Debug image save
+            try:
+                debug_img = img.copy()
+                cv2.rectangle(debug_img,
+                              (best["x"] - best["w"] // 2, best["y"] - best["h"] // 2),
+                              (best["x"] + best["w"] // 2, best["y"] + best["h"] // 2),
+                              (0, 255, 0), 2)
+                cv2.imwrite(f"debug_click_bot{bot['id']}.png", debug_img)
+            except Exception:
+                pass
 
-        try:
-            debug_img = img.copy()
-            cv2.rectangle(debug_img,
-                          (best["x"] - best["w"] // 2, best["y"] - best["h"] // 2),
-                          (best["x"] + best["w"] // 2, best["y"] + best["h"] // 2),
-                          (0, 255, 0), 3)
-            cv2.imwrite(f"debug_click_bot{bot['id']}.png", debug_img)
-        except Exception:
-            pass
+            return (best["x"], best["y"])
 
-        return (best["x"], best["y"])
+        # ------------------ METHOD 2: CLOUDFLARE ORANGE CLOUD DETECTOR ------------------
+        print(f"⚠️ [Bot {bot['id']}] Box border not isolated, scanning for Cloudflare Orange Logo...")
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # Orange cloud color range
+        lower_orange = np.array([10, 140, 160])
+        upper_orange = np.array([25, 255, 255])
+        orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
+
+        cloud_contours, _ = cv2.findContours(orange_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cc in cloud_contours:
+            area = cv2.contourArea(cc)
+            if 300 < area < 2500:
+                cx, cy, cw, ch = cv2.boundingRect(cc)
+                # Cloud logo mil gaya, checkbox is se taqreeban 185px left par hota hai
+                target_box_x = cx - 185
+                target_box_y = cy + ch // 2 + 5
+
+                if target_box_x > 0:
+                    print(f"🎯 [Bot {bot['id']}] Located via Orange Cloud! Target Box: ({target_box_x}, {target_box_y})")
+                    return (target_box_x, target_box_y)
+
+        print(f"⚠️ [Bot {bot['id']}] Neither Box nor Orange Logo found.")
+        return None
 
     except Exception as e:
         print(f"❌ [Bot {bot['id']}] Detection error: {e}")
@@ -282,12 +304,11 @@ def detect_checkbox_position(bot):
 # ================== CLOUDFLARE HANDLER ==================
 def handle_cloudflare(bot, page_text):
     """
-    Smart handler with proper delay and coordinate validation
+    Smart handler with position memory and auto-fallback
     """
-    # Agar saved position ghalat thi (X < 75), to foran delete karo
+    # Bad saved pos check
     if bot["saved_pos"] is not None:
-        if bot["saved_pos"][0] < 75:
-            print(f"🗑️ [Bot {bot['id']}] Bad saved pos detected {bot['saved_pos']}. Discarding.")
+        if bot["saved_pos"][0] < 60:
             bot["saved_pos"] = None
 
     # PHASE 1: SAVED POSITION
@@ -296,7 +317,7 @@ def handle_cloudflare(bot, page_text):
         print(f"🧠 [Bot {bot['id']}] Using SAVED position: ({x}, {y})")
         time.sleep(1.5)
         if safe_click(bot, x, y):
-            time.sleep(6)  # Cloudflare verification circle ghoomne ka wait
+            time.sleep(6)  # Verification circle delay
             return True
 
     # PHASE 2: FRESH DETECTION
@@ -314,16 +335,17 @@ def handle_cloudflare(bot, page_text):
                 bot["saved_pos"] = (x, y)
                 bot["failed_attempts"] = 0
                 print(f"🧠 [Bot {bot['id']}] Position SAVED: ({x}, {y})")
-                time.sleep(6)  # Verification delay
+                time.sleep(6)
                 return True
             else:
                 print(f"⚠️ [Bot {bot['id']}] Click failed. Retrying...")
         else:
-            print(f"⏳ [Bot {bot['id']}] Attempt {attempt+1}: Box not ready, waiting...")
+            print(f"⏳ [Bot {bot['id']}] Attempt {attempt+1}: Widget not ready, waiting...")
         time.sleep(1.5)
 
     print(f"❌ [Bot {bot['id']}] Could not detect/click after 8 attempts.")
     return False
+
 # ================== BOT THREAD ==================
 def bot_thread(bot):
     print(f"=========================================")
@@ -388,12 +410,10 @@ def bot_thread(bot):
 
                 print(f"🚨 [Bot {bot['id']}] CLOUDFLARE DETECTED!")
 
-                # Handle it
                 handle_cloudflare(bot, page_text)
 
                 time.sleep(8)
 
-                # Check karo success hui ya nahi
                 try:
                     cmd_id += 1
                     cdp_command(bot["cdp_ws"], cmd_id, "Runtime.evaluate", {
@@ -444,7 +464,7 @@ if __name__ == "__main__":
     print("💡 Anti-Idle Screen Protector: ENABLED")
     print("=========================================")
 
-    # 1. Anti-Idle Thread start taake screen kabhi sleep/lock na ho
+    # 1. Anti-Idle Thread start
     idle_thread = threading.Thread(target=keep_screen_alive, daemon=True)
     idle_thread.start()
 
