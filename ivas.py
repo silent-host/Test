@@ -286,11 +286,16 @@ def detect_checkbox_position(bot):
             area = cv2.contourArea(cc)
             if 300 < area < 2500:
                 cx, cy, cw, ch = cv2.boundingRect(cc)
+                
+                # Sirf Browser wale hissay (X < 900) me search karein, Desktop par nahi
+                if cx > 900:
+                    continue
+
                 # Cloud logo mil gaya, checkbox is se taqreeban 185px left par hota hai
                 target_box_x = cx - 185
                 target_box_y = cy + ch // 2 + 5
 
-                if target_box_x > 0:
+                if 60 < target_box_x < 900:
                     print(f"🎯 [Bot {bot['id']}] Located via Orange Cloud! Target Box: ({target_box_x}, {target_box_y})")
                     return (target_box_x, target_box_y)
 
