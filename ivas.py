@@ -201,6 +201,7 @@ def safe_click(bot, cx, cy):
         return False
 
 # ================== DETECTION (OPENCV) ==================
+# ================== DETECTION (OPENCV) ==================
 def detect_checkbox_position(bot):
     """Screenshot lo, 24-36px square dhoondo, position return karo"""
     img = take_screenshot(bot)
@@ -216,14 +217,12 @@ def detect_checkbox_position(bot):
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
         edges = cv2.Canny(blurred, 50, 150)
 
-        # RETR_TREE taake container ke andar wala actual checkbox pakra ja sake
         contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
         for cnt in contours:
             try:
                 area = cv2.contourArea(cnt)
-                # Cloudflare checkbox 26px se 32px (Area: 550 se 1500) hota hai
                 if 550 < area < 1500:
                     peri = cv2.arcLength(cnt, True)
                     approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
@@ -234,8 +233,12 @@ def detect_checkbox_position(bot):
                             if 0.85 <= ar <= 1.15:
                                 cx = x + w // 2
                                 cy = y + h // 2
+                                
+                                # Filter 1: Border clicks avoid karein (X kam az kam 75px se bara ho)
+                                if cx < 75 or cy < 100:
+                                    continue
+
                                 center_color = img[cy, cx]
-                                # Checkbox ka center bright/white hona chahiye
                                 if (center_color[0] > 190 and
                                     center_color[1] > 190 and
                                     center_color[2] > 190):
@@ -250,15 +253,16 @@ def detect_checkbox_position(bot):
             print(f"⚠️ [Bot {bot['id']}] No {MIN_SIZE}-{MAX_SIZE}px square found.")
             return None
 
-        # Screen center ke qareeb tareen candidate select karo
-        screen_cx = screen_w // 2
-        screen_cy = screen_h // 2
-        candidates.sort(key=lambda c: abs(c["x"] - screen_cx) + abs(c["y"] - screen_cy))
-        best = candidates[0]
+        # Filter 2: Cloudflare Widget area aam tor par (X: 80 se 160) aur (Y: 380 se 500) me hota hai
+        # Sab se pehle widget area wale box ko tarjeeh do
+        widget_candidates = [c for c in candidates if 80 <= c["x"] <= 180 and 350 <= c["y"] <= 550]
+        if widget_candidates:
+            best = widget_candidates[0]
+        else:
+            best = candidates[0]
 
-        print(f"🎯 [Bot {bot['id']}] Found {len(candidates)} candidate(s). Best: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
+        print(f"🎯 [Bot {bot['id']}] Found {len(candidates)} candidate(s). Selected Best: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
 
-        # Debug image save karega tasdeeq ke liye
         try:
             debug_img = img.copy()
             cv2.rectangle(debug_img,
@@ -278,30 +282,31 @@ def detect_checkbox_position(bot):
 # ================== CLOUDFLARE HANDLER ==================
 def handle_cloudflare(bot, page_text):
     """
-    Smart handler:
-    1. Agar saved_pos hai -> wait 1.5s, direct click
-    2. Click ke baad check karo -> page text badla?
-    3. Agar nahi badla (3 baar) -> dobara detect karo
+    Smart handler with proper delay and coordinate validation
     """
-    # ================== PHASE 1: SAVED POSITION ==================
+    # Agar saved position ghalat thi (X < 75), to foran delete karo
+    if bot["saved_pos"] is not None:
+        if bot["saved_pos"][0] < 75:
+            print(f"🗑️ [Bot {bot['id']}] Bad saved pos detected {bot['saved_pos']}. Discarding.")
+            bot["saved_pos"] = None
+
+    # PHASE 1: SAVED POSITION
     if bot["saved_pos"] is not None:
         x, y = bot["saved_pos"]
         print(f"🧠 [Bot {bot['id']}] Using SAVED position: ({x}, {y})")
-
         time.sleep(1.5)
-
         if safe_click(bot, x, y):
-            time.sleep(4)
+            time.sleep(6)  # Cloudflare verification circle ghoomne ka wait
             return True
 
-    # ================== PHASE 2: FRESH DETECTION ==================
+    # PHASE 2: FRESH DETECTION
     print(f"🔍 [Bot {bot['id']}] No saved position. Detecting via OpenCV...")
 
     for attempt in range(8):
         pos = detect_checkbox_position(bot)
         if pos:
             x, y = pos
-            print(f"🎯 [Bot {bot['id']}] Detected: ({x}, {y})")
+            print(f"🎯 [Bot {bot['id']}] Detected target: ({x}, {y})")
 
             time.sleep(1.5)
 
@@ -309,7 +314,7 @@ def handle_cloudflare(bot, page_text):
                 bot["saved_pos"] = (x, y)
                 bot["failed_attempts"] = 0
                 print(f"🧠 [Bot {bot['id']}] Position SAVED: ({x}, {y})")
-                time.sleep(5)
+                time.sleep(6)  # Verification delay
                 return True
             else:
                 print(f"⚠️ [Bot {bot['id']}] Click failed. Retrying...")
@@ -319,7 +324,6 @@ def handle_cloudflare(bot, page_text):
 
     print(f"❌ [Bot {bot['id']}] Could not detect/click after 8 attempts.")
     return False
-
 # ================== BOT THREAD ==================
 def bot_thread(bot):
     print(f"=========================================")
