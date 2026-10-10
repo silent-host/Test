@@ -25,7 +25,7 @@ BOTS = [
     },
 ]
 
-# نئے سائز کی حدود (لینکس کے لیے تھوڑے لچکدار)
+# سائز کی حدود
 MIN_SIZE = 20
 MAX_SIZE = 50
 MAX_FAILED_BEFORE_REDETECT = 3
@@ -197,6 +197,7 @@ def detect_checkbox_position(bot):
     1. Sirf Chakor (Square) box dhoondega.
     2. Box ke andar ka rang safaid (White) hona chahiye.
     3. Box ke right side par Text (Verify) ka block hona chahiye.
+    4. Screen ke upar wale hissay (Y < 400) ko completely ignore karega.
     """
     img = take_screenshot(bot)
     if img is None:
@@ -234,29 +235,32 @@ def detect_checkbox_position(bot):
                         cx = x + w // 2
                         cy = y + h // 2
 
-                        # Filter 3: Screen ke left side mein hona chahiye (Terminal se bachne ke liye)
-                        if cx > screen_w * 0.6: 
+                        # ================== SAKHT FILTER ==================
+                        # Screen ke upar wale hissay ko ignore karo (URL bar, website title, etc.)
+                        # Kyunke asli captcha box hamesha screen ke nichlay hissay mein hota hai.
+                        if cy < 400: 
                             continue
+                        
+                        # Right side (Terminal window) ko ignore karo
+                        if cx > screen_w * 0.6:
+                            continue
+                        # ===================================================
 
-                        # Filter 4: Box ka center safaid (White) hona chahiye
+                        # Filter 3: Box ka center safaid (White) hona chahiye
                         center_color = img[cy, cx]
                         if all(c > 200 for c in center_color):
                             
-                            # Filter 5: "Verify" Text Check (Box ke right side par text block hona chahiye)
-                            # Text area box ke right side se shuru hota hai
+                            # Filter 4: "Verify" Text Check (Box ke right side par text block hona chahiye)
                             text_zone_x_start = x + w + 5
                             text_zone_x_end = min(x + w + 120, screen_w)
                             
                             if text_zone_x_end > text_zone_x_start:
-                                # Text zone crop karo
                                 text_zone = gray[y:y+h, text_zone_x_start:text_zone_x_end]
-                                
                                 # Agar wahan text hai, to pixels ka standard deviation zyada hoga
-                                # (Safaid background par kaalay text ka std dev > 30 hota hai)
                                 if np.std(text_zone) > 25:
                                     best_candidate = (cx, cy)
                                     print(f"🎯 [Bot {bot['id']}] Perfect Chakor Box + Verify Text Found: ({cx}, {cy}) size={w}x{h}")
-                                    break # Best candidate mil gaya
+                                    break
             except Exception:
                 continue
 
@@ -275,7 +279,6 @@ def detect_checkbox_position(bot):
         # ------------------ BACKUP: ORANGE CLOUD ------------------
         print(f"⚠️ [Bot {bot['id']}] Box not found directly, checking Orange Cloud...")
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        # Linux swiftshader ke liye orange range thori wide ki hai
         lower_orange = np.array([5, 100, 100])
         upper_orange = np.array([30, 255, 255])
         orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
@@ -285,7 +288,8 @@ def detect_checkbox_position(bot):
             area = cv2.contourArea(cc)
             if 300 < area < 2500:
                 cx, cy, cw, ch = cv2.boundingRect(cc)
-                if cx < screen_w * 0.6 and cy > 100: # Screen ke left side
+                # Sirf nichlay hissay mein dhoondo (Y > 400)
+                if cx < screen_w * 0.6 and cy > 400:
                     target_box_x = cx - 185
                     target_box_y = cy + ch // 2 + 5
                     print(f"🎯 [Bot {bot['id']}] Located via Orange Cloud! Box: ({target_box_x}, {target_box_y})")
@@ -301,9 +305,9 @@ def detect_checkbox_position(bot):
 # ================== CLOUDFLARE HANDLER ==================
 def handle_cloudflare(bot, page_text):
     if bot["saved_pos"] is not None:
-        # Agar saved position screen ke top par hai (Y < 100), to discard karo
-        if bot["saved_pos"][1] < 100:
-            print(f"🗑️ [Bot {bot['id']}] Discarding invalid saved pos: {bot['saved_pos']}")
+        # Agar saved position screen ke top par hai (Y < 400), to discard karo
+        if bot["saved_pos"][1] < 400:
+            print(f"🗑️ [Bot {bot['id']}] Discarding invalid saved pos (Top Area): {bot['saved_pos']}")
             bot["saved_pos"] = None
 
     # PHASE 1: SAVED POSITION
@@ -381,7 +385,9 @@ def bot_thread(bot):
             print(f"🔄 [Bot {bot['id']}] Refreshing...")
             cdp_command(bot["cdp_ws"], cmd_id, "Page.reload", {"ignoreCache": False})
             cdp_wait_response(bot["cdp_ws"], cmd_id, timeout=15)
-            time.sleep(5)
+            
+            # Refresh ke baad thora wait karo taake page load ho jaye
+            time.sleep(4)
 
             page_text = ""
             try:
@@ -401,7 +407,12 @@ def bot_thread(bot):
                 "Verify you are human" in page_text or
                 "malicious bots" in page_text):
 
-                print(f"🚨 [Bot {bot['id']}] CLOUDFLARE DETECTED!")
+                print(f"🚨 [Bot {bot['id']}] CLOUDFLARE DETECTED! Waiting 6 seconds for it to fully load...")
+                
+                # ================== YEH HAI ASAL FIX ==================
+                # Captcha load hone ke liye 6 second ka intezar karo
+                time.sleep(6) 
+                # ======================================================
 
                 handle_cloudflare(bot, page_text)
                 time.sleep(6)
@@ -450,9 +461,8 @@ if __name__ == "__main__":
     print("🤖 MULTI-BOT (Edge Automation - Linux Optimized)")
     print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
     print("🧠 SMART: Square Shape + Verify Text Detection")
-    print("🎯 Target Zone: Left Side of Screen")
-    print("⚡ Fast Refresh: 20-30s")
-    print("💡 Anti-Idle Screen Protector: ENABLED")
+    print("🎯 Target Zone: Y > 400 (Nichla Hissa)")
+    print("⏳ Wait Time: 6 seconds after CAPTCHA detection")
     print("=========================================")
 
     idle_thread = threading.Thread(target=keep_screen_alive, daemon=True)
