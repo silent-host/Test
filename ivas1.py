@@ -25,8 +25,9 @@ BOTS = [
     },
 ]
 
-MIN_SIZE = 24
-MAX_SIZE = 38
+# نئے سائز کی حدود (لینکس کے لیے تھوڑے لچکدار)
+MIN_SIZE = 20
+MAX_SIZE = 50
 MAX_FAILED_BEFORE_REDETECT = 3
 
 # ================== KEEP ALIVE (ANTI-IDLE) ==================
@@ -189,13 +190,13 @@ def safe_click(bot, cx, cy):
         print(f"❌ [Bot {bot['id']}] Click failed: {e}")
         return False
 
-# ================== DETECTION (OPENCV SMART MATCHER) ==================
+# ================== DETECTION (NEW SHAPE & TEXT BASED) ==================
 def detect_checkbox_position(bot):
     """
-    Koshish:
-    1. Y > 520 (Sirf widget zone me chakor box)
-    2. 'O' aur gol dairo ko filter out karo
-    3. Backup: Cloudflare Orange Cloud
+    Naya Logic:
+    1. Sirf Chakor (Square) box dhoondega.
+    2. Box ke andar ka rang safaid (White) hona chahiye.
+    3. Box ke right side par Text (Verify) ka block hona chahiye.
     """
     img = take_screenshot(bot)
     if img is None:
@@ -208,71 +209,75 @@ def detect_checkbox_position(bot):
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # Border mask (dark borders)
-        border_mask = cv2.inRange(gray, 40, 140)
-        contours, _ = cv2.findContours(border_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        # 1. Dark borders ko highlight karne ke liye threshold
+        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+        
+        # 2. Contours dhoondo
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        candidates = []
+        best_candidate = None
+
         for cnt in contours:
             try:
                 area = cv2.contourArea(cnt)
                 peri = cv2.arcLength(cnt, True)
-                if peri == 0:
-                    continue
-
-                # Circularity: Gol 'O' ka score 0.85+ hota hai, chakor ka kam hota hai
-                circularity = 4 * np.pi * (area / (peri * peri))
-                approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+                if peri == 0: continue
 
                 x, y, w, h = cv2.boundingRect(cnt)
 
-                # Filter: Size 24px se 38px
+                # Filter 1: Size (Chakor box 20-50px ka hota hai)
                 if MIN_SIZE <= w <= MAX_SIZE and MIN_SIZE <= h <= MAX_SIZE:
                     ar = float(w) / h
-                    # Bilkul square (0.88 se 1.12)
-                    if 0.88 <= ar <= 1.12:
+                    
+                    # Filter 2: Aspect Ratio (Bilkul chakor 0.8 se 1.2 ke darmiyan)
+                    if 0.8 <= ar <= 1.2:
                         cx = x + w // 2
                         cy = y + h // 2
 
-                        # SAKHT FILTER: Y hamesha 520 se bara ho taake upar ke kisi text/O ko na chhue
-                        if cy < 520 or cx > 350 or cx < 60:
+                        # Filter 3: Screen ke left side mein hona chahiye (Terminal se bachne ke liye)
+                        if cx > screen_w * 0.6: 
                             continue
 
-                        # Gol shape ko reject karo
-                        if len(approx) > 5 or circularity > 0.85:
-                            continue
-
-                        # Center pure white hona chahiye
+                        # Filter 4: Box ka center safaid (White) hona chahiye
                         center_color = img[cy, cx]
-                        if center_color[0] > 215 and center_color[1] > 215 and center_color[2] > 215:
-                            candidates.append({
-                                "x": cx, "y": cy,
-                                "w": w, "h": h
-                            })
+                        if all(c > 200 for c in center_color):
+                            
+                            # Filter 5: "Verify" Text Check (Box ke right side par text block hona chahiye)
+                            # Text area box ke right side se shuru hota hai
+                            text_zone_x_start = x + w + 5
+                            text_zone_x_end = min(x + w + 120, screen_w)
+                            
+                            if text_zone_x_end > text_zone_x_start:
+                                # Text zone crop karo
+                                text_zone = gray[y:y+h, text_zone_x_start:text_zone_x_end]
+                                
+                                # Agar wahan text hai, to pixels ka standard deviation zyada hoga
+                                # (Safaid background par kaalay text ka std dev > 30 hota hai)
+                                if np.std(text_zone) > 25:
+                                    best_candidate = (cx, cy)
+                                    print(f"🎯 [Bot {bot['id']}] Perfect Chakor Box + Verify Text Found: ({cx}, {cy}) size={w}x{h}")
+                                    break # Best candidate mil gaya
             except Exception:
                 continue
 
-        if candidates:
-            best = candidates[0]
-            print(f"🎯 [Bot {bot['id']}] Chakor Box Found: ({best['x']}, {best['y']}) size={best['w']}x{best['h']}")
-
+        if best_candidate:
             try:
                 debug_img = img.copy()
                 cv2.rectangle(debug_img,
-                              (best["x"] - best["w"] // 2, best["y"] - best["h"] // 2),
-                              (best["x"] + best["w"] // 2, best["y"] + best["h"] // 2),
+                              (best_candidate[0] - 20, best_candidate[1] - 20),
+                              (best_candidate[0] + 20, best_candidate[1] + 20),
                               (0, 255, 0), 2)
                 cv2.imwrite(f"debug_click_bot{bot['id']}.png", debug_img)
             except Exception:
                 pass
-
-            return (best["x"], best["y"])
+            return best_candidate
 
         # ------------------ BACKUP: ORANGE CLOUD ------------------
         print(f"⚠️ [Bot {bot['id']}] Box not found directly, checking Orange Cloud...")
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower_orange = np.array([10, 140, 160])
-        upper_orange = np.array([25, 255, 255])
+        # Linux swiftshader ke liye orange range thori wide ki hai
+        lower_orange = np.array([5, 100, 100])
+        upper_orange = np.array([30, 255, 255])
         orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
 
         cloud_contours, _ = cv2.findContours(orange_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -280,8 +285,7 @@ def detect_checkbox_position(bot):
             area = cv2.contourArea(cc)
             if 300 < area < 2500:
                 cx, cy, cw, ch = cv2.boundingRect(cc)
-                # Sirf widget zone (X < 900 aur Y > 520)
-                if cx < 900 and cy > 520:
+                if cx < screen_w * 0.6 and cy > 100: # Screen ke left side
                     target_box_x = cx - 185
                     target_box_y = cy + ch // 2 + 5
                     print(f"🎯 [Bot {bot['id']}] Located via Orange Cloud! Box: ({target_box_x}, {target_box_y})")
@@ -296,12 +300,9 @@ def detect_checkbox_position(bot):
 
 # ================== CLOUDFLARE HANDLER ==================
 def handle_cloudflare(bot, page_text):
-    """
-    Smart handler with position memory
-    """
-    # Bad saved pos check (agar Y < 520 ho to foran delete karo)
     if bot["saved_pos"] is not None:
-        if bot["saved_pos"][1] < 520:
+        # Agar saved position screen ke top par hai (Y < 100), to discard karo
+        if bot["saved_pos"][1] < 100:
             print(f"🗑️ [Bot {bot['id']}] Discarding invalid saved pos: {bot['saved_pos']}")
             bot["saved_pos"] = None
 
@@ -368,7 +369,6 @@ def bot_thread(bot):
 
     while True:
         try:
-            # 20 se 30 second refresh time taake fast testing ho sake
             wait_sec = random.randint(20, 30)
             print(f"⏳ [Bot {bot['id']}] Next refresh in {wait_sec}s...")
             time.sleep(wait_sec)
@@ -383,7 +383,6 @@ def bot_thread(bot):
             cdp_wait_response(bot["cdp_ws"], cmd_id, timeout=15)
             time.sleep(5)
 
-            # Text nikalo
             page_text = ""
             try:
                 cmd_id += 1
@@ -398,7 +397,6 @@ def bot_thread(bot):
             except Exception as e:
                 print(f"⚠️ [Bot {bot['id']}] Text error: {e}")
 
-            # Cloudflare detect
             if ("Performing security verification" in page_text or
                 "Verify you are human" in page_text or
                 "malicious bots" in page_text):
@@ -406,7 +404,6 @@ def bot_thread(bot):
                 print(f"🚨 [Bot {bot['id']}] CLOUDFLARE DETECTED!")
 
                 handle_cloudflare(bot, page_text)
-
                 time.sleep(6)
 
                 try:
@@ -450,10 +447,10 @@ def bot_thread(bot):
 # ================== MAIN ==================
 if __name__ == "__main__":
     print("=========================================")
-    print("🤖 MULTI-BOT (Edge Automation)")
+    print("🤖 MULTI-BOT (Edge Automation - Linux Optimized)")
     print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
-    print("🧠 SMART: Position Memory + Auto-Fallback")
-    print("🎯 Target Zone: Y > 520, X < 350 (No Text 'O')")
+    print("🧠 SMART: Square Shape + Verify Text Detection")
+    print("🎯 Target Zone: Left Side of Screen")
     print("⚡ Fast Refresh: 20-30s")
     print("💡 Anti-Idle Screen Protector: ENABLED")
     print("=========================================")
