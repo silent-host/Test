@@ -43,7 +43,7 @@ def keep_screen_alive():
         except Exception:
             pass
 
-# ================== WEBSOCKET ==================
+# ================== WEBSOCKET TO GO SERVER ==================
 def connect_to_server(bot):
     try:
         bot["ws_client"] = websocket.create_connection(bot["ws_server"], timeout=10)
@@ -53,18 +53,20 @@ def connect_to_server(bot):
         print(f"⚠️ [Bot {bot['id']}] WS Error: {e}")
         return False
 
-def send_data_to_server(bot, data):
+def send_data_to_server(bot, raw_data):
+    """Raw WebSocket frame data ko direct server par forward karta hai"""
     try:
         if bot["ws_client"] is None:
             if not connect_to_server(bot):
                 return
-        payload = {
-            "botId": bot["id"],
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "data": data
-        }
-        bot["ws_client"].send(json.dumps(payload))
-        print(f"📤 [Bot {bot['id']}] Data sent.")
+        
+        if isinstance(raw_data, (dict, list)):
+            payload = json.dumps(raw_data)
+        else:
+            payload = str(raw_data)
+            
+        bot["ws_client"].send(payload)
+        print(f"📤 [Bot {bot['id']}] Live Raw Frame forwarded ({len(payload)} bytes)")
     except Exception as e:
         print(f"❌ [Bot {bot['id']}] Send error: {e}")
         bot["ws_client"] = None
@@ -128,6 +130,10 @@ def ensure_cdp(bot):
             return False
         bot["cdp_ws"] = websocket.create_connection(cdp_url, timeout=10, suppress_origin=True)
         print(f"✅ [Bot {bot['id']}] CDP Connected!")
+        
+        # Network & Page Domains enable karein
+        cdp_command(bot["cdp_ws"], 101, "Network.enable")
+        cdp_command(bot["cdp_ws"], 102, "Page.enable")
         return True
     except Exception as e:
         print(f"❌ [Bot {bot['id']}] CDP failed: {e}")
@@ -192,13 +198,6 @@ def safe_click(bot, cx, cy):
 
 # ================== DETECTION (NEW SHAPE & TEXT BASED) ==================
 def detect_checkbox_position(bot):
-    """
-    Naya Logic:
-    1. Sirf Chakor (Square) box dhoondega.
-    2. Box ke andar ka rang safaid (White) hona chahiye.
-    3. Box ke right side par Text (Verify) ka block hona chahiye.
-    4. Screen ke upar wale hissay (Y < 400) ko completely ignore karega.
-    """
     img = take_screenshot(bot)
     if img is None:
         print(f"❌ [Bot {bot['id']}] No screenshot.")
@@ -206,98 +205,61 @@ def detect_checkbox_position(bot):
 
     try:
         screen_h, screen_w = img.shape[:2]
-        print(f"🔍 [Bot {bot['id']}] Scanning ({screen_w}x{screen_h})...")
-
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # 1. Dark borders ko highlight karne ke liye threshold
         _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-        
-        # 2. Contours dhoondo
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         best_candidate = None
 
         for cnt in contours:
             try:
-                area = cv2.contourArea(cnt)
                 peri = cv2.arcLength(cnt, True)
                 if peri == 0: continue
 
                 x, y, w, h = cv2.boundingRect(cnt)
 
-                # Filter 1: Size (Chakor box 20-50px ka hota hai)
                 if MIN_SIZE <= w <= MAX_SIZE and MIN_SIZE <= h <= MAX_SIZE:
                     ar = float(w) / h
-                    
-                    # Filter 2: Aspect Ratio (Bilkul chakor 0.8 se 1.2 ke darmiyan)
                     if 0.8 <= ar <= 1.2:
                         cx = x + w // 2
                         cy = y + h // 2
 
-                        # ================== SAKHT FILTER ==================
-                        # Screen ke upar wale hissay ko ignore karo (URL bar, website title, etc.)
-                        # Kyunke asli captcha box hamesha screen ke nichlay hissay mein hota hai.
-                        if cy < 400: 
+                        if cy < 400 or cx > screen_w * 0.6: 
                             continue
-                        
-                        # Right side (Terminal window) ko ignore karo
-                        if cx > screen_w * 0.6:
-                            continue
-                        # ===================================================
 
-                        # Filter 3: Box ka center safaid (White) hona chahiye
                         center_color = img[cy, cx]
                         if all(c > 200 for c in center_color):
-                            
-                            # Filter 4: "Verify" Text Check (Box ke right side par text block hona chahiye)
                             text_zone_x_start = x + w + 5
                             text_zone_x_end = min(x + w + 120, screen_w)
                             
                             if text_zone_x_end > text_zone_x_start:
                                 text_zone = gray[y:y+h, text_zone_x_start:text_zone_x_end]
-                                # Agar wahan text hai, to pixels ka standard deviation zyada hoga
                                 if np.std(text_zone) > 25:
                                     best_candidate = (cx, cy)
-                                    print(f"🎯 [Bot {bot['id']}] Perfect Chakor Box + Verify Text Found: ({cx}, {cy}) size={w}x{h}")
+                                    print(f"🎯 [Bot {bot['id']}] Chakor Box Found: ({cx}, {cy})")
                                     break
             except Exception:
                 continue
 
         if best_candidate:
-            try:
-                debug_img = img.copy()
-                cv2.rectangle(debug_img,
-                              (best_candidate[0] - 20, best_candidate[1] - 20),
-                              (best_candidate[0] + 20, best_candidate[1] + 20),
-                              (0, 255, 0), 2)
-                cv2.imwrite(f"debug_click_bot{bot['id']}.png", debug_img)
-            except Exception:
-                pass
             return best_candidate
 
-        # ------------------ BACKUP: ORANGE CLOUD ------------------
-        print(f"⚠️ [Bot {bot['id']}] Box not found directly, checking Orange Cloud...")
+        # BACKUP: ORANGE CLOUD
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower_orange = np.array([5, 100, 100])
-        upper_orange = np.array([30, 255, 255])
-        orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
-
+        orange_mask = cv2.inRange(hsv, np.array([5, 100, 100]), np.array([30, 255, 255]))
         cloud_contours, _ = cv2.findContours(orange_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cc in cloud_contours:
             area = cv2.contourArea(cc)
             if 300 < area < 2500:
                 cx, cy, cw, ch = cv2.boundingRect(cc)
-                # Sirf nichlay hissay mein dhoondo (Y > 400)
                 if cx < screen_w * 0.6 and cy > 400:
                     target_box_x = cx - 185
                     target_box_y = cy + ch // 2 + 5
                     print(f"🎯 [Bot {bot['id']}] Located via Orange Cloud! Box: ({target_box_x}, {target_box_y})")
                     return (target_box_x, target_box_y)
 
-        print(f"⚠️ [Bot {bot['id']}] No valid checkbox found.")
         return None
-
     except Exception as e:
         print(f"❌ [Bot {bot['id']}] Detection error: {e}")
         return None
@@ -305,12 +267,9 @@ def detect_checkbox_position(bot):
 # ================== CLOUDFLARE HANDLER ==================
 def handle_cloudflare(bot, page_text):
     if bot["saved_pos"] is not None:
-        # Agar saved position screen ke top par hai (Y < 400), to discard karo
         if bot["saved_pos"][1] < 400:
-            print(f"🗑️ [Bot {bot['id']}] Discarding invalid saved pos (Top Area): {bot['saved_pos']}")
             bot["saved_pos"] = None
 
-    # PHASE 1: SAVED POSITION
     if bot["saved_pos"] is not None:
         x, y = bot["saved_pos"]
         print(f"🧠 [Bot {bot['id']}] Using SAVED position: ({x}, {y})")
@@ -319,38 +278,28 @@ def handle_cloudflare(bot, page_text):
             time.sleep(6)
             return True
 
-    # PHASE 2: FRESH DETECTION
     print(f"🔍 [Bot {bot['id']}] Detecting fresh position via OpenCV...")
-
     for attempt in range(8):
         pos = detect_checkbox_position(bot)
         if pos:
             x, y = pos
             print(f"🎯 [Bot {bot['id']}] Target locked: ({x}, {y})")
-
             time.sleep(1.5)
-
             if safe_click(bot, x, y):
                 bot["saved_pos"] = (x, y)
                 bot["failed_attempts"] = 0
-                print(f"🧠 [Bot {bot['id']}] Position SAVED: ({x}, {y})")
                 time.sleep(6)
                 return True
-            else:
-                print(f"⚠️ [Bot {bot['id']}] Click failed. Retrying...")
-        else:
-            print(f"⏳ [Bot {bot['id']}] Attempt {attempt+1}: Waiting for widget...")
         time.sleep(1.5)
 
-    print(f"❌ [Bot {bot['id']}] Could not detect/click after 8 attempts.")
+    print(f"❌ [Bot {bot['id']}] Could not solve CAPTCHA.")
     return False
 
 # ================== BOT THREAD ==================
 def bot_thread(bot):
     print(f"=========================================")
     print(f"🤖 [Bot {bot['id']}] Starting (port {bot['edge_port']})")
-    print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
-    print(f"🧠 Position Memory ENABLED")
+    print(f"📡 Real-time WebSocket Frame Interceptor Activated")
     print(f"=========================================")
 
     for _ in range(5):
@@ -370,24 +319,58 @@ def bot_thread(bot):
     cdp_command(bot["cdp_ws"], cmd_id, "Page.navigate", {"url": bot["target_url"]})
     cdp_wait_response(bot["cdp_ws"], cmd_id, timeout=10)
     print(f"🌐 [Bot {bot['id']}] Page opened.")
+    time.sleep(5)
+
+    # Initial Network enable
+    cdp_command(bot["cdp_ws"], 101, "Network.enable")
+    cdp_command(bot["cdp_ws"], 102, "Page.enable")
 
     while True:
         try:
-            wait_sec = random.randint(20, 30)
-            print(f"⏳ [Bot {bot['id']}] Next refresh in {wait_sec}s...")
-            time.sleep(wait_sec)
+            # 8 minutes (480s) se 8.5 minutes (510s) ke darmiyan random reload time
+            reload_interval = random.randint(480, 510)
+            print(f"⏳ [Bot {bot['id']}] Session active. Next reload scheduled in {reload_interval}s ({reload_interval//60}m {reload_interval%60}s)...")
 
+            # ----------------- LIVE WEBSOCKET LISTENING -----------------
+            cycle_start = time.time()
+            while (time.time() - cycle_start) < reload_interval:
+                try:
+                    if not ensure_cdp(bot):
+                        time.sleep(2)
+                        continue
+
+                    bot["cdp_ws"].settimeout(1.0)
+                    raw_event = bot["cdp_ws"].recv()
+                    
+                    if raw_event:
+                        event = json.loads(raw_event)
+                        method = event.get("method", "")
+
+                        # Website ke real WebSocket raw packets capture karein
+                        if method == "Network.webSocketFrameReceived":
+                            payload = event.get("params", {}).get("response", {}).get("payloadData", "")
+                            if payload:
+                                send_data_to_server(bot, payload)
+
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception as e:
+                    print(f"⚠️ [Bot {bot['id']}] CDP Frame read exception: {e}")
+                    time.sleep(1)
+                    break
+
+            # ----------------- RELOAD & CAPTCHA CHECK -----------------
             if not ensure_cdp(bot):
                 time.sleep(5)
                 continue
 
             cmd_id += 1
-            print(f"🔄 [Bot {bot['id']}] Refreshing...")
+            print(f"🔄 [Bot {bot['id']}] Reloading page (Session Refresh)...")
             cdp_command(bot["cdp_ws"], cmd_id, "Page.reload", {"ignoreCache": False})
-            cdp_wait_response(bot["cdp_ws"], cmd_id, timeout=15)
-            
-            # Refresh ke baad thora wait karo taake page load ho jaye
-            time.sleep(4)
+            time.sleep(5)
+
+            # Re-hook Network Domain right after reload
+            cdp_command(bot["cdp_ws"], 103, "Network.enable")
 
             page_text = ""
             try:
@@ -407,62 +390,27 @@ def bot_thread(bot):
                 "Verify you are human" in page_text or
                 "malicious bots" in page_text):
 
-                print(f"🚨 [Bot {bot['id']}] CLOUDFLARE DETECTED! Waiting 6 seconds for it to fully load...")
-                
-                # ================== YEH HAI ASAL FIX ==================
-                # Captcha load hone ke liye 6 second ka intezar karo
-                time.sleep(6) 
-                # ======================================================
-
+                print(f"🚨 [Bot {bot['id']}] CLOUDFLARE DETECTED! Resolving...")
+                time.sleep(6)
                 handle_cloudflare(bot, page_text)
                 time.sleep(6)
 
-                try:
-                    cmd_id += 1
-                    cdp_command(bot["cdp_ws"], cmd_id, "Runtime.evaluate", {
-                        "expression": "document.body.innerText",
-                        "returnByValue": True
-                    })
-                    response = cdp_wait_response(bot["cdp_ws"], cmd_id, timeout=10)
-                    if response and "result" in response:
-                        result = response["result"].get("result", {})
-                        new_text = result.get("value", "")
-
-                        if ("Performing security verification" in new_text or
-                            "Verify you are human" in new_text):
-
-                            bot["failed_attempts"] += 1
-                            print(f"⚠️ [Bot {bot['id']}] CAPTCHA STILL THERE. Failed attempts: {bot['failed_attempts']}")
-
-                            if bot["failed_attempts"] >= MAX_FAILED_BEFORE_REDETECT:
-                                print(f"🗑️ [Bot {bot['id']}] Clearing saved position (3 fails). Will re-detect.")
-                                bot["saved_pos"] = None
-                                bot["failed_attempts"] = 0
-                        else:
-                            print(f"✅ [Bot {bot['id']}] CAPTCHA SOLVED!")
-                            bot["failed_attempts"] = 0
-                            page_text = new_text
-                except Exception as e:
-                    print(f"⚠️ [Bot {bot['id']}] Verification check error: {e}")
+                # CAPTCHA clear hone ke baad Network hooks dobara bind karein
+                cdp_command(bot["cdp_ws"], 104, "Network.enable")
             else:
-                print(f"✅ [Bot {bot['id']}] No CAPTCHA.")
-                bot["failed_attempts"] = 0
-
-            send_data_to_server(bot, page_text)
+                print(f"✅ [Bot {bot['id']}] No CAPTCHA detected. Hooks are Live.")
 
         except Exception as e:
-            print(f"❌ [Bot {bot['id']}] Error: {e}")
-            time.sleep(5)
+            print(f"❌ [Bot {bot['id']}] Loop Error: {e}")
+            time.sleep(3)
             continue
 
 # ================== MAIN ==================
 if __name__ == "__main__":
     print("=========================================")
-    print("🤖 MULTI-BOT (Edge Automation - Linux Optimized)")
+    print("🤖 MULTI-BOT (Edge Automation - 24/7 Live Stream)")
     print(f"📏 Size Filter: {MIN_SIZE}-{MAX_SIZE}px")
-    print("🧠 SMART: Square Shape + Verify Text Detection")
-    print("🎯 Target Zone: Y > 400 (Nichla Hissa)")
-    print("⏳ Wait Time: 6 seconds after CAPTCHA detection")
+    print("🎯 Auto-Reload: 8 - 8.5 Minutes (Randomized)")
     print("=========================================")
 
     idle_thread = threading.Thread(target=keep_screen_alive, daemon=True)
